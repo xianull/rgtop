@@ -1,5 +1,12 @@
 # rgtop
 
+[![Release](https://img.shields.io/github/v/release/xianull/rgtop)](https://github.com/xianull/rgtop/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/xianull/rgtop/release.yml?branch=main&label=CI)](https://github.com/xianull/rgtop/actions/workflows/release.yml)
+[![Downloads](https://img.shields.io/github/downloads/xianull/rgtop/total)](https://github.com/xianull/rgtop/releases)
+[![License](https://img.shields.io/github/license/xianull/rgtop)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-informational)](#安装)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?logo=rust)](https://www.rust-lang.org)
+
 [English](README.md) | **简体中文**
 
 **rgtop**（**r**emote **G**PU **top**，远程 GPU 版 top）是 btop 风格的多机 GPU / CPU / 内存实时看板。在本地运行，通过 SSH 连接各台服务器，键盘和鼠标都能操作。本地只有一个约 700 KB 的静态二进制，服务器上什么都不用装。

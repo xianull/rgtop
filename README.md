@@ -1,5 +1,12 @@
 # rgtop
 
+[![Release](https://img.shields.io/github/v/release/xianull/rgtop)](https://github.com/xianull/rgtop/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/xianull/rgtop/release.yml?branch=main&label=CI)](https://github.com/xianull/rgtop/actions/workflows/release.yml)
+[![Downloads](https://img.shields.io/github/downloads/xianull/rgtop/total)](https://github.com/xianull/rgtop/releases)
+[![License](https://img.shields.io/github/license/xianull/rgtop)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-informational)](#install)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?logo=rust)](https://www.rust-lang.org)
+
 **English** | [简体中文](README.zh-CN.md)
 
 **rgtop** (**r**emote **G**PU **top**) is a btop-style live dashboard for NVIDIA GPUs, CPUs and memory on many remote servers, over plain SSH. One ~700 KB static binary on your machine; nothing to install on the servers.
