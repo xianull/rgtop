@@ -56,6 +56,36 @@ rgtop connects to **Host aliases** from `~/.ssh/config` (see `ssh_config.example
 
 A host that can't be reached shows a red error card and retries with backoff; the others are unaffected.
 
+## Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `RGTOP_HOSTS` | hosts to show when none are given as arguments: SSH aliases, separated by spaces or commas |
+| `RGTOP_THEME` | `auto`, `dark` or `light`: the theme until settings are first saved; after that the saved theme wins (switch it with `t`, or override with `--theme`) |
+| `XDG_CONFIG_HOME` | config location: `$XDG_CONFIG_HOME/rgtop/` (default `~/.config/rgtop/`) |
+| `NO_COLOR` | set to anything: no colours |
+| `COLORTERM` | `truecolor` or `24bit` turns on 24-bit colour (most modern terminals set it); otherwise 256 colours are used |
+| `COLUMNS` | width of `rgtop -1` output when it doesn't go to a terminal (default 80) |
+| `RGTOP_INSTALL_DIR`, `RGTOP_VERSION` | used by `install.sh`, see [Install](#install) |
+
+`GPUSTATUS_HOSTS` and `GPUSTATUS_THEME` still work when the `RGTOP_` variables aren't set.
+
+To set one for a single run, put it in front of the command; to keep it, add an `export` line to your shell's startup file:
+
+```bash
+# this run only
+RGTOP_HOSTS="gpu-h100-1 gpu-h100-2" rgtop
+
+# zsh (the macOS default): ~/.zshrc; bash: ~/.bashrc
+echo 'export RGTOP_HOSTS="gpu-h100-1 gpu-h100-2"' >> ~/.zshrc
+source ~/.zshrc          # apply it to the shell you're in; new terminals get it anyway
+
+# fish
+set -Ux RGTOP_HOSTS "gpu-h100-1 gpu-h100-2"
+```
+
+Check it with `echo $RGTOP_HOSTS`. If your shell says `rgtop: command not found` after installing, add the install directory to `PATH` the same way: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`.
+
 ## Usage
 
 ```bash

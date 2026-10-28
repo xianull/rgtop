@@ -56,6 +56,36 @@ curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | RGT
 
 连不上的机器只显示一个红色错误卡片并按退避间隔重连，不影响其他机器。
 
+## 环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `RGTOP_HOSTS` | 命令行没给主机时要显示的机器：SSH 别名，空格或逗号分隔 |
+| `RGTOP_THEME` | `auto`、`dark` 或 `light`：第一次保存设置之前用的配色；保存之后以保存的为准（按 `t` 切换，或用 `--theme` 临时指定） |
+| `XDG_CONFIG_HOME` | 配置目录：`$XDG_CONFIG_HOME/rgtop/`（默认 `~/.config/rgtop/`） |
+| `NO_COLOR` | 设成任意值：不显示颜色 |
+| `COLORTERM` | `truecolor` 或 `24bit` 时使用 24 位真彩色（大多数现代终端会自动设置）；否则用 256 色 |
+| `COLUMNS` | `rgtop -1` 的输出不是终端时（比如重定向到文件）使用的宽度，默认 80 |
+| `RGTOP_INSTALL_DIR`、`RGTOP_VERSION` | 给 `install.sh` 用，见[安装](#安装) |
+
+没设置 `RGTOP_` 开头的变量时，旧的 `GPUSTATUS_HOSTS`、`GPUSTATUS_THEME` 仍然有效。
+
+只想这一次生效，就写在命令前面；想一直生效，就把 `export` 那一行加到 shell 的启动文件里：
+
+```bash
+# 只对这一次运行生效
+RGTOP_HOSTS="gpu-h100-1 gpu-h100-2" rgtop
+
+# zsh（macOS 默认）写进 ~/.zshrc；bash 写进 ~/.bashrc
+echo 'export RGTOP_HOSTS="gpu-h100-1 gpu-h100-2"' >> ~/.zshrc
+source ~/.zshrc          # 让当前这个终端立刻生效；新开的终端会自动生效
+
+# fish
+set -Ux RGTOP_HOSTS "gpu-h100-1 gpu-h100-2"
+```
+
+用 `echo $RGTOP_HOSTS` 检查是否设置成功。如果安装后提示 `rgtop: command not found`，用同样的方法把安装目录加进 `PATH`：`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`。
+
 ## 使用
 
 ```bash
