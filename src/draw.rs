@@ -258,7 +258,7 @@ fn fmt_gpus(ix: &[u32]) -> String {
 }
 
 fn thousands(v: f64) -> String {
-    let s = format!("{v:.0}");
+    let s = format!("{:.0}", v.round() + 0.0); // + 0.0: an empty f64 sum is -0.0
     let (sign, d) = s.strip_prefix('-').map_or(("", s.as_str()), |d| ("-", d));
     let mut out = String::from(sign);
     for (k, c) in d.chars().enumerate() {
@@ -1232,5 +1232,21 @@ impl Renderer {
             });
         self.animating = pulsing || self.tw.moving;
         Frame { header, cols, anchors, order }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formatting() {
+        assert_eq!(thousands(std::iter::empty::<f64>().sum()), "0");
+        assert_eq!(thousands(1576.6), "1,577");
+        assert_eq!(thousands(1234567.0), "1,234,567");
+        assert_eq!(fmt_gpus(&[0, 1, 2, 3, 6]), "0-3,6");
+        let mut l = line("a中b", PLAIN);
+        l.fit(3); // the wide char can't be split: blank + ellipsis
+        assert_eq!(l.cells.iter().map(|c| c.ch).collect::<String>(), "a …");
     }
 }

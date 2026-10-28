@@ -1,6 +1,6 @@
 [package]
 name = "gpustatus"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2024"
 description = "btop-style live GPU/CPU dashboard for remote NVIDIA servers over SSH"
 license = "MIT"
