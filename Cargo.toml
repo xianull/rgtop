@@ -1,0 +1,20 @@
+[package]
+name = "gpustatus"
+version = "3.0.0"
+edition = "2024"
+description = "btop-style live GPU/CPU dashboard for remote NVIDIA servers over SSH"
+license = "MIT"
+repository = "https://github.com/xianull/gpustatus"
+keywords = ["gpu", "nvidia", "monitoring", "tui", "ssh"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+signal-hook = "0.3"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

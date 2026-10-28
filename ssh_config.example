@@ -1,0 +1,16 @@
+# Append to ~/.ssh/config. gpustatus connects by Host alias, so each server
+# needs key-based login first:  ssh-copy-id <alias>
+
+Host gpu-a100-1
+    HostName 10.0.0.11
+    User alice
+
+Host gpu-h100-1
+    HostName 10.0.0.21
+    User alice
+
+# a server behind a jump host
+Host gpu-h100-2
+    HostName 10.0.1.22
+    User alice
+    ProxyJump bastion.example.com
