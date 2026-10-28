@@ -1,16 +1,16 @@
 #!/bin/sh
-# Install gpustatus from GitHub releases:
-#   curl -fsSL https://raw.githubusercontent.com/xianull/gpustatus/main/install.sh | sh
+# Install rgtop from GitHub releases:
+#   curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | sh
 # Options (environment variables):
-#   GPUSTATUS_VERSION=v3.0.0       a specific release instead of the latest
-#   GPUSTATUS_INSTALL_DIR=/usr/local/bin   where to put the binary (default ~/.local/bin)
+#   RGTOP_VERSION=v4.0.0       a specific release instead of the latest
+#   RGTOP_INSTALL_DIR=/usr/local/bin   where to put the binary (default ~/.local/bin)
 set -eu
 
-repo=xianull/gpustatus
-version=${GPUSTATUS_VERSION:-latest}
-dir=${GPUSTATUS_INSTALL_DIR:-$HOME/.local/bin}
+repo=xianull/rgtop
+version=${RGTOP_VERSION:-latest}
+dir=${RGTOP_INSTALL_DIR:-$HOME/.local/bin}
 
-die() { echo "gpustatus install: $*" >&2; exit 1; }
+die() { echo "rgtop install: $*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Linux) os=unknown-linux-musl ;;
@@ -22,7 +22,7 @@ case "$(uname -m)" in
   arm64 | aarch64) arch=aarch64 ;;
   *) die "unsupported CPU: $(uname -m)" ;;
 esac
-asset="gpustatus-$arch-$os.tar.gz"
+asset="rgtop-$arch-$os.tar.gz"
 if [ "$version" = latest ]; then
   base="https://github.com/$repo/releases/latest/download"
 else
@@ -52,10 +52,10 @@ want=$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$dir"
-rm -f "$dir/gpustatus" # replace a symlink (e.g. an old pip/uv install) instead of writing through it
-cp "$tmp/gpustatus" "$dir/gpustatus"
-chmod 755 "$dir/gpustatus"
-echo "installed $("$dir/gpustatus" --version) to $dir/gpustatus"
+rm -f "$dir/rgtop" # replace a symlink (e.g. an old pip/uv install) instead of writing through it
+cp "$tmp/rgtop" "$dir/rgtop"
+chmod 755 "$dir/rgtop"
+echo "installed $("$dir/rgtop" --version) to $dir/rgtop"
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "note: $dir is not on your PATH; add:  export PATH=\"$dir:\$PATH\"" ;;

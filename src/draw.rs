@@ -10,13 +10,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::Act;
 use crate::collect::{Gpu, HISTORY, Host, Proc, Sample, Status, UNKNOWN};
-use crate::settings::{SORTS, Settings};
+use crate::settings::{SORTS, Settings, fmt_interval};
 use crate::term::{BLANK, Cell, PLAIN, Style, WIDE_TAIL};
 use crate::theme::Theme;
 
 pub const FPS: f64 = 60.0; // frame rate while something is animating
-const TWEEN_TAU: f64 = 0.12; // seconds; easing time constant for bars, numbers, dots
-const PULSE_SECS: f64 = 0.6; // status dot glows for this long after each fresh sample
+const TWEEN_TAU: f64 = 0.12; // seconds; easing time constant (less when sampling faster than ~3/s)
+const PULSE_SECS: f64 = 0.6; // status dot glows after each fresh sample (intervals of 1 s and up)
 const CARD_MIN_WIDTH: usize = 80; // narrower terminals get fewer card columns
 const PROC_MAX: usize = 8; // process rows per host card
 
@@ -37,6 +37,7 @@ const GAP: usize = 2;
 const K_CPU: u32 = u32::MAX;
 const K_RAM: u32 = u32::MAX - 1;
 const K_DOT: u32 = u32::MAX - 2;
+const K_CACHE: u32 = u32::MAX - 3;
 
 // ── lines with click zones ───────────────────────────────────────────────────
 fn char_w(c: char) -> usize {
@@ -83,20 +84,37 @@ fn rjust(s: &str, w: usize) -> String {
 pub struct Line {
     pub cells: Vec<Cell>,
     pub zones: Vec<(usize, usize, Act)>,
+    pub optional: bool, // a column header: dropped when the cards don't fit the screen
 }
 
 fn line(s: &str, st: Style) -> Line {
-    let mut l = Line::default();
+    let mut l = Line::new();
     l.add(s, st);
     l
 }
 
 impl Line {
+    /// Room for a full screen row up front: rows grow cell by cell (and card
+    /// rows get the next column appended), so growing from empty would
+    /// reallocate and copy ~6 times per row.
+    pub fn new() -> Self {
+        Self::with_capacity(256)
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Line { cells: Vec::with_capacity(n), zones: Vec::new(), optional: false }
+    }
+
     pub fn w(&self) -> usize {
         self.cells.len()
     }
 
     pub fn add(&mut self, s: &str, st: Style) -> &mut Self {
+        if s.is_ascii() {
+            // fast path for the bulk of the text: one cell per byte, no width table
+            self.cells.extend(s.bytes().map(|b| Cell { ch: if b < 0x20 || b == 0x7f { '?' } else { b as char }, st }));
+            return self;
+        }
         for ch in s.chars() {
             // control characters from remote data must never reach the terminal
             let (ch, w) = if ch.is_control() { ('?', 1) } else { (ch, ch.width().unwrap_or(1)) };
@@ -174,8 +192,8 @@ pub struct Tweener {
 }
 
 impl Tweener {
-    fn begin(&mut self, dt: Option<f64>) {
-        self.alpha = dt.map_or(1.0, |d| 1.0 - (-d.max(0.0) / TWEEN_TAU).exp());
+    fn begin(&mut self, dt: Option<f64>, tau: f64) {
+        self.alpha = dt.map_or(1.0, |d| 1.0 - (-d.max(0.0) / tau).exp());
         self.moving = false;
         self.frame += 1;
     }
@@ -206,6 +224,41 @@ impl Tweener {
 }
 
 // ── small formatters and glyph helpers ───────────────────────────────────────
+/// f64 with no decimals. `{:.0}` / `{:.1}` on floats take std's exact
+/// (dragon4, bignum) path for many values; via integers it is a few ns.
+/// Width / alignment flags work as usual.
+struct D0(f64);
+/// f64 with one decimal.
+struct D1(f64);
+
+impl std::fmt::Display for D0 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(&(self.0.round() as i64), f) // also: -0.0 prints as 0
+    }
+}
+
+impl std::fmt::Display for D1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let t = (self.0 * 10.0).round() as i64;
+        let (mut b, mut i, mut n) = ([0u8; 24], 24, t.unsigned_abs());
+        i -= 2;
+        (b[i], b[i + 1]) = (b'.', b'0' + (n % 10) as u8);
+        n /= 10;
+        loop {
+            i -= 1;
+            b[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if t < 0 {
+            i -= 1;
+            b[i] = b'-';
+        }
+        f.pad(std::str::from_utf8(&b[i..]).unwrap_or("?"))
+    }
+}
 struct Ctx<'a> {
     th: &'a Theme,
     st: &'a Settings,
@@ -214,6 +267,8 @@ struct Ctx<'a> {
     live: bool,
     paused: bool,
     stale_after: f64,
+    iv: f64,   // refresh interval, seconds
+    ng: usize, // most GPUs on any host: folded cards pad their strips to it
 }
 
 fn since(now: Instant, t: Instant) -> f64 {
@@ -225,7 +280,7 @@ fn spin(secs: f64) -> char {
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
-    v.map_or("    -".into(), |v| format!("{v:>4.0}%"))
+    v.map_or("    -".into(), |v| format!("{:>4}%", D0(v)))
 }
 
 fn fmt_age(sec: Option<u64>) -> String {
@@ -258,7 +313,7 @@ fn fmt_gpus(ix: &[u32]) -> String {
 }
 
 fn thousands(v: f64) -> String {
-    let s = format!("{:.0}", v.round() + 0.0); // + 0.0: an empty f64 sum is -0.0
+    let s = D0(v).to_string();
     let (sign, d) = s.strip_prefix('-').map_or(("", s.as_str()), |d| ("-", d));
     let mut out = String::from(sign);
     for (k, c) in d.chars().enumerate() {
@@ -285,6 +340,45 @@ fn short_cmd(cmd: &str) -> String {
     if rest.is_empty() { head.into() } else { format!("{head} {rest}") }
 }
 
+/// GiB, one decimal below 10.
+fn fmt_gib(kb: u64) -> String {
+    let g = kb as f64 / 1048576.0;
+    if g < 10.0 { format!("{}G", D1(g)) } else { format!("{}G", D0(g)) }
+}
+
+/// process RSS
+fn fmt_kb(kb: u64) -> String {
+    if kb >= 1048576 { format!("{}G", D1(kb as f64 / 1048576.0)) } else { format!("{}M", kb / 1024) }
+}
+
+/// %CPU, where 100 = one core
+fn fmt_cpu(c: f64) -> String {
+    if c >= 99.95 { D0(c).to_string() } else { D1(c).to_string() }
+}
+
+fn fmt_uptime(secs: f64) -> String {
+    let s = secs as u64;
+    match s {
+        86400.. => format!("up {}d", s / 86400),
+        3600.. => format!("up {}h", s / 3600),
+        _ => format!("up {}m", s / 60),
+    }
+}
+
+/// "INTEL(R) XEON(R) PLATINUM 8558" -> "XEON PLATINUM 8558",
+/// "AMD EPYC 9654 96-Core Processor" -> "EPYC 9654"
+fn short_cpu(model: &str) -> String {
+    let m = model.split('@').next().unwrap_or(model);
+    let m = m.replace("(R)", "").replace("(r)", "").replace("(TM)", "").replace("(tm)", "");
+    m.split_whitespace()
+        .filter(|w| {
+            let l = w.to_ascii_lowercase();
+            !matches!(l.as_str(), "intel" | "amd" | "cpu" | "processor") && !l.ends_with("-core")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Filled length of a meter in 1/8 cells (what is actually visible).
 fn bar_units(pct: f64, width: usize) -> usize {
     (pct.clamp(0.0, 100.0) * width as f64 * 8.0 / 100.0).round() as usize
@@ -306,6 +400,26 @@ fn put_bar(ln: &mut Line, pct: f64, width: usize, th: &Theme) {
         used += 1;
     }
     ln.fill(width - used, ' ', th.track);
+}
+
+/// RAM meter: used memory on the gradient, page cache after it in a muted tone.
+fn put_mem_bar(ln: &mut Line, used: f64, cache: f64, width: usize, th: &Theme) {
+    let uu = bar_units(used, width);
+    let cu = bar_units(used + cache, width).max(uu);
+    let span = width.saturating_sub(1).max(1);
+    for i in 0..width {
+        let (lo, pct) = (i * 8, i * 100 / span);
+        let (ch, st) = if lo + 8 <= uu {
+            ('█', th.bar(pct))
+        } else if lo < uu {
+            (EIGHTHS[uu - lo], th.bar_on(pct, cu >= lo + 8))
+        } else if lo + 4 <= cu {
+            ('█', th.cache_cell())
+        } else {
+            (' ', th.track)
+        };
+        ln.cells.push(Cell { ch, st });
+    }
 }
 
 fn spark_lvl(v: Option<f64>) -> usize {
@@ -357,6 +471,11 @@ fn ram_pct(s: &Sample) -> Option<f64> {
     (t > 0.0).then(|| 100.0 * (t - s.mem_avail_kb as f64) / t)
 }
 
+fn cache_pct(s: &Sample) -> f64 {
+    let t = s.mem_total_kb as f64;
+    if t > 0.0 { (100.0 * s.mem_cache_kb as f64 / t).min(100.0 - ram_pct(s).unwrap_or(0.0)).max(0.0) } else { 0.0 }
+}
+
 /// (1-minute load, cores)
 fn load_of(s: &Sample) -> Option<(f64, u32)> {
     match (s.load, s.cores) {
@@ -399,7 +518,7 @@ fn status_dot(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host) -> (char, Style) {
         return ('●', th.state[hs]);
     }
     let v = tw.ease((i, K_DOT), hs as f64 * 50.0, hs as f64 * 50.0);
-    ('●', th.dot(v / 50.0, glow(age)))
+    ('●', th.dot(v / 50.0, if cx.iv >= 1.0 { glow(age) } else { 0.0 })) // faster: it would never fade
 }
 
 // ── card content ─────────────────────────────────────────────────────────────
@@ -411,17 +530,6 @@ struct Cols {
     bar_m: usize,
     user: usize,
     spark: usize,
-}
-
-impl Cols {
-    fn tail(&self) -> usize {
-        (if self.user > 0 { GAP + self.user } else { 0 })
-            + (if self.spark > 0 { GAP + self.spark } else { 0 })
-            + GAP
-            + TEMP_W
-            + 1
-            + PWR_W
-    }
 }
 
 fn plan_cols(cw: usize, gpus: &[Gpu], hist: bool, user: bool) -> Cols {
@@ -443,24 +551,66 @@ fn plan_cols(cw: usize, gpus: &[Gpu], hist: bool, user: bool) -> Cols {
     Cols { prefix, idx_w, name_w, bar_u: flex / 2, bar_m: flex - flex / 2, user: uw, spark }
 }
 
-/// CPU / RAM / load, column-aligned with the GPU rows below it. Numbers ease
-/// together with their bars.
-fn sys_line(s: &Sample, c: &Cols, th: &Theme, cpu: f64, ram: f64) -> Line {
+/// Two host rows, column-aligned with the GPU rows below:
+///   CPU meter | RAM meter (used + cache) | swap | CPU history | CPU temperature
+///   per-core strip (busiest core of each cell)            load 1 / 5 / 15 min
+/// Numbers ease together with their meters.
+#[allow(clippy::too_many_arguments)]
+fn sys_rows(
+    s: &Sample,
+    hist: &VecDeque<f32>,
+    c: &Cols,
+    cw: usize,
+    th: &Theme,
+    cpu: f64,
+    used: f64,
+    cache: f64,
+) -> [Line; 2] {
     let mut ln = line(&ljust("CPU", c.prefix), th.dim);
     put_bar(&mut ln, cpu, c.bar_u, th);
     let cpu = s.cpu_pct.map(|_| cpu);
     ln.add(&fmt_pct(cpu), th.level(cpu)).add("  ", PLAIN).add("RAM ", th.dim);
+    put_mem_bar(&mut ln, used, cache, c.bar_m.saturating_sub(4), th);
     let tot = s.mem_total_kb as f64 / 1048576.0;
-    put_bar(&mut ln, ram, c.bar_m.saturating_sub(4), th);
-    let txt = if tot > 0.0 { format!("{:.0}/{tot:.0}G", ram / 100.0 * tot) } else { "-".into() };
+    let txt = if tot > 0.0 { format!("{}/{}G", D0(used / 100.0 * tot), D0(tot)) } else { "-".into() };
     ln.add(&rjust(&txt, MEM_W), PLAIN);
-    if let Some((l, n)) = load_of(s) {
-        let (val, rest) = (format!("{l:.1}"), format!("/{n}c"));
-        let label = if c.tail() >= val.len() + rest.len() + 6 { "load " } else { "" };
-        ln.pad(c.tail().saturating_sub(label.len() + val.len() + rest.len()).max(1));
-        ln.add(label, th.dim).add(&val, th.level(Some(l / n as f64 / 1.2 * 100.0))).add(&rest, th.dim);
+    let swap_used = s.swap_total_kb.saturating_sub(s.swap_free_kb);
+    let swap = (s.swap_total_kb > 0).then(|| {
+        let st = if swap_used * 4 > s.swap_total_kb { th.warn } else { th.dim }; // a quarter used: worth a look
+        (format!("swap {}", fmt_gib(swap_used)), st)
+    });
+    if c.user > 0 {
+        let (t, st) = swap.clone().unwrap_or_default();
+        ln.add("  ", PLAIN).add(&ljust(&cut(&t, c.user), c.user), st);
     }
-    ln
+    if c.spark > 0 {
+        ln.add("  ", PLAIN);
+        put_spark(&mut ln, Some(hist), c.spark, th);
+    }
+    ln.add("  ", PLAIN);
+    match s.cpu_temp {
+        Some(t) => ln.add(&format!("{:>3}°", D0(t)), th.temp(t)),
+        None => ln.add(&rjust("-", TEMP_W), th.dim),
+    };
+
+    let label = s.cores.map_or(String::new(), |n| format!("{n}c"));
+    let mut r2 = line(&ljust(&label, c.prefix.max(label.len() + 1)), th.dim);
+    let mut right = Line::default();
+    if let Some(l) = s.load {
+        let n = s.cores.unwrap_or(1).max(1) as f64;
+        right.add("load ", th.dim).add(&D1(l[0]).to_string(), th.level(Some(l[0] / n / 1.2 * 100.0)));
+        right.add(&format!(" {} {}", D1(l[1]), D1(l[2])), th.dim);
+    }
+    if let Some((t, st)) = swap.filter(|_| c.user == 0) {
+        right.add("  ", PLAIN).add(&t, st);
+    }
+    let room = cw.saturating_sub(r2.w() + right.w() + 2);
+    if !s.core_pct.is_empty() && room >= 8 {
+        let g = s.core_pct.len().div_ceil(room);
+        put_strip(&mut r2, s.core_pct.chunks(g).map(|ch| Some(ch.iter().fold(0.0f32, |a, &b| a.max(b)) as f64)), th);
+    }
+    r2.pad(cw.saturating_sub(r2.w() + right.w())).extend(&right);
+    [ln, r2]
 }
 
 fn gpu_header(c: &Cols, th: &Theme) -> Line {
@@ -526,7 +676,7 @@ fn gpu_row(
     ln.add(&fmt_pct(ut), th.level(ut)).add("  ", PLAIN);
     put_bar(&mut ln, m, c.bar_m, th);
     let used = m / 100.0 * g.mem_total / 1024.0;
-    ln.add(&rjust(&format!("{used:.1}/{:.0}G", g.mem_total / 1024.0), MEM_W), PLAIN);
+    ln.add(&rjust(&format!("{}/{}G", D1(used), D0(g.mem_total / 1024.0)), MEM_W), PLAIN);
     if c.user > 0 {
         ln.add("  ", PLAIN);
         user_cell(&mut ln, &g.users, me, known, c.user, th);
@@ -538,24 +688,24 @@ fn gpu_row(
     ln.add("  ", PLAIN);
     match g.temp {
         None => ln.add(&rjust("-", TEMP_W), th.dim),
-        Some(t) => ln.add(&format!("{t:>3.0}°"), th.temp(t)),
+        Some(t) => ln.add(&format!("{:>3}°", D0(t)), th.temp(t)),
     };
     ln.add(" ", PLAIN);
     match g.power {
         None => ln.add(&rjust("-", PWR_W), th.dim),
         Some(p) => {
             let ratio = g.power_limit.filter(|&l| l > 0.0).map_or(0.0, |l| 100.0 * p / l);
-            ln.add(&format!("{p:>4.0}W"), th.level(Some(ratio)))
+            ln.add(&format!("{:>4}W", D0(p)), th.level(Some(ratio)))
         }
     };
     ln
 }
 
 fn fmt_vram(mem: f64) -> String {
-    if mem != 0.0 { format!("{:>5.1}G", mem / 1024.0) } else { "     -".into() }
+    if mem != 0.0 { format!("{:>5}G", D1(mem / 1024.0)) } else { "     -".into() }
 }
 
-fn proc_section(s: &Sample, cw: usize, th: &Theme, compact: bool) -> Vec<Line> {
+fn proc_section(s: &Sample, cw: usize, th: &Theme) -> Vec<Line> {
     let mut rule = Line::default();
     rule.fill(cw, '─', th.border);
     let mut out = vec![rule];
@@ -576,26 +726,37 @@ fn proc_section(s: &Sample, cw: usize, th: &Theme, compact: bool) -> Vec<Line> {
     let pid_w = shown.iter().map(|p| p.pid.to_string().len()).max().unwrap_or(0).max(3);
     let user_w = shown.iter().map(|p| str_w(&p.user)).max().unwrap_or(0).clamp(4, 12);
     let gpu_w = gl.iter().map(String::len).max().unwrap_or(0).clamp(3, 11);
-    if !compact {
-        out.push(line(
-            &format!(
-                "{:>pid_w$}  {:<user_w$}  {:<gpu_w$}  {:>6}  {:>6}  COMMAND",
-                "PID", "USER", "GPU", "VRAM", "TIME"
-            ),
-            th.dim,
-        ));
+    let host = shown.iter().any(|p| p.rss_kb.is_some()); // agent.py also reports host CPU / RAM
+    let mut h = format!("{:>pid_w$}  {:<user_w$}  {:<gpu_w$}  {:>6}  ", "PID", "USER", "GPU", "VRAM");
+    if host {
+        h += &format!("{:>5}  {:>6}  ", "%CPU", "RSS");
     }
+    let mut head = line(&(h + &format!("{:>6}  COMMAND", "TIME")), th.dim);
+    head.optional = true;
+    out.push(head);
     for (p, g) in shown.iter().zip(&gl) {
         let mut ln = Line::default();
         let gpus = ljust(&crop(g, gpu_w), gpu_w) + "  ";
         if p.pid == 0 {
             ln.add(&format!("{:>pid_w$}  {:<user_w$}  ", "-", UNKNOWN), th.dim).add(&gpus, th.dim);
-            ln.add(&fmt_vram(p.mem), th.dim).add(&format!("  {:>6}  {}", "-", p.cmd), th.dim);
+            ln.add(&fmt_vram(p.mem), th.dim);
+            if host {
+                ln.add(&format!("  {:>5}  {:>6}", "-", "-"), th.dim);
+            }
+            ln.add(&format!("  {:>6}  {}", "-", p.cmd), th.dim);
         } else {
             ln.add(&format!("{:>pid_w$}  ", p.pid), th.dim);
             let u = crop(&p.user, user_w);
             ln.add(&u, if p.user == s.me { th.me } else { th.fg });
             ln.pad(user_w - str_w(&u) + 2).add(&gpus, PLAIN).add(&fmt_vram(p.mem), PLAIN);
+            if host {
+                ln.add("  ", PLAIN);
+                match p.cpu {
+                    Some(c) => ln.add(&rjust(&fmt_cpu(c), 5), th.level(Some(c.min(100.0)))),
+                    None => ln.add(&rjust("-", 5), th.dim),
+                };
+                ln.add("  ", PLAIN).add(&rjust(&p.rss_kb.map_or("-".into(), fmt_kb), 6), PLAIN);
+            }
             ln.add(&format!("  {:>6}  ", fmt_age(p.etime)), th.dim);
             ln.add(&if p.cmd.is_empty() { "?".into() } else { short_cmd(&p.cmd) }, PLAIN);
         }
@@ -604,23 +765,36 @@ fn proc_section(s: &Sample, cw: usize, th: &Theme, compact: bool) -> Vec<Line> {
     if procs.len() > shown.len() {
         out.push(line(&format!("… {} more, sorted by VRAM", procs.len() - shown.len()), th.dim));
     }
+    if !s.host_users.is_empty() {
+        // who is busy on the CPUs right now, GPU jobs or not (100% = one core)
+        let mut ln = line("cpu users  ", th.dim);
+        for (k, (u, c, rss)) in s.host_users.iter().enumerate() {
+            ln.add(if k > 0 { " · " } else { "" }, th.dim).add(u, if *u == s.me { th.me } else { th.fg });
+            ln.add(&format!(" {}% {}", D0(*c), fmt_kb(*rss)), th.dim);
+        }
+        out.push(ln);
+    }
     out
 }
 
-/// One-line host summary: used by folded cards.
-fn fold_line(s: &Sample, th: &Theme) -> Line {
+/// One-line host summary for folded cards. Every field has a fixed width and
+/// the strips are padded to the largest GPU count, so folded cards line up.
+fn fold_line(s: &Sample, th: &Theme, ng: usize) -> Line {
     let mut ln = line("CPU ", th.dim);
-    ln.add(fmt_pct(s.cpu_pct).trim_start(), th.level(s.cpu_pct));
+    ln.add(&fmt_pct(s.cpu_pct)[1..], th.level(s.cpu_pct)); // "  7%" … "100%"
     let rp = ram_pct(s);
-    ln.add("  RAM ", th.dim).add(fmt_pct(rp).trim_start(), th.level(rp));
-    if let Some((l, n)) = load_of(s) {
-        ln.add("  load ", th.dim).add(&format!("{l:.1}"), th.level(Some(l / n as f64 / 1.2 * 100.0)));
-        ln.add(&format!("/{n}c"), th.dim);
-    }
+    ln.add("  RAM ", th.dim).add(&fmt_pct(rp)[1..], th.level(rp)).add("  load ", th.dim);
+    match load_of(s) {
+        Some((l, n)) => {
+            ln.add(&rjust(&D1(l).to_string(), 5), th.level(Some(l / n as f64 / 1.2 * 100.0)));
+            ln.add(&ljust(&format!("/{n}c"), 6), th.dim)
+        }
+        None => ln.add(&ljust(&rjust("-", 5), 11), th.dim),
+    };
     if !s.gpus.is_empty() {
-        ln.add("  UTIL ", th.dim);
+        ln.add(" UTIL ", th.dim);
         put_strip(&mut ln, s.gpus.iter().map(|g| g.util), th);
-        ln.add("  VRAM ", th.dim);
+        ln.pad(ng.saturating_sub(s.gpus.len())).add("  VRAM ", th.dim);
         put_strip(&mut ln, s.gpus.iter().map(|g| Some(g.mem_pct())), th);
     }
     ln
@@ -639,18 +813,28 @@ fn card_title(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, folded: bool) -> (
     if models.len() == 1 {
         left.add(&format!("  {}× {}", s.gpus.len(), models.first().unwrap()), th.dim);
     }
+    if !s.cpu_model.is_empty() {
+        let n = if s.sockets > 1 { format!("{}× ", s.sockets) } else { String::new() };
+        left.add(&format!(" · {n}{}", short_cpu(&s.cpu_model)), th.dim);
+    }
     let age = since(cx.now, h.updated);
     if cx.live && !cx.paused && h.status == Status::Ok && age > cx.stale_after {
-        right.add(&format!("stale {age:.0}s"), th.warn).add(" · ", th.dim);
+        right.add(&format!("stale {}s", D0(age)), th.warn).add(" · ", th.dim);
     }
     if !s.gpus.is_empty() {
         let idle = s.gpus.iter().filter(|g| g.state() == 0).count();
         right.add(&idle.to_string(), if idle > 0 { th.state[0] } else { th.dim });
         right.add(&format!("/{} idle", s.gpus.len()), th.dim).add(" · ", th.dim);
-        right.add(&format!("{:.0}G", free_gib(&s.gpus)), PLAIN).add(" free", th.dim);
+        right.add(&format!("{}G", D0(free_gib(&s.gpus))), PLAIN).add(" free", th.dim);
     }
-    let bottom = h.latency.filter(|_| cx.live).map(|l| line(&format!("↻ {:.0}ms", l * 1000.0), th.dim));
-    (left, right, bottom)
+    let mut bottom = Line::default();
+    if let Some(u) = s.uptime {
+        bottom.add(&fmt_uptime(u), th.dim);
+    }
+    if let Some(l) = h.latency.filter(|_| cx.live) {
+        bottom.add(if bottom.w() > 0 { " · " } else { "" }, th.dim).add(&format!("↻ {}ms", D0(l * 1000.0)), th.dim);
+    }
+    (left, right, (bottom.w() > 0).then_some(bottom))
 }
 
 /// Word-wrap by display width; words longer than a line are hard-broken.
@@ -683,7 +867,7 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folded: bool, compact: bool) -> Vec<Line> {
+fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folded: bool) -> Vec<Line> {
     let (th, st) = (cx.th, cx.st);
     let cw = width.saturating_sub(4);
     let mut body = Vec::new();
@@ -694,7 +878,7 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
 
     let Some(s) = &h.sample else {
         if h.status == Status::Connecting {
-            body.push(line(&format!("connecting… {:.0}s", since(cx.now, h.since)), th.dim));
+            body.push(line(&format!("connecting… {}s", D0(since(cx.now, h.since))), th.dim));
         } else {
             let err = h.error.as_deref().unwrap_or("unknown error");
             for part in wrap(err, cw.max(10)).into_iter().take(if folded { 1 } else { 2 }) {
@@ -707,7 +891,7 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
         return body;
     };
     if folded {
-        body.push(fold_line(s, th));
+        body.push(fold_line(s, th, cx.ng));
         return body;
     }
 
@@ -715,14 +899,15 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
     let c = plan_cols(cw, &s.gpus, cx.live && st.show_hist, st.show_user);
     if st.show_cpu {
         let cpu = tw.ease((i, K_CPU), s.cpu_pct.unwrap_or(0.0), 0.0);
-        let ram = tw.ease((i, K_RAM), ram_pct(s).unwrap_or(0.0), 0.0);
-        body.push(sys_line(s, &c, th, cpu, ram));
+        let used = tw.ease((i, K_RAM), ram_pct(s).unwrap_or(0.0), 0.0);
+        let cache = tw.ease((i, K_CACHE), cache_pct(s), 0.0);
+        body.extend(sys_rows(s, &h.history.cpu, &c, cw, th, cpu, used, cache));
     }
     let vis: Vec<&Gpu> = s.gpus.iter().filter(|g| !st.free_only || g.state() < 2).collect();
     if !vis.is_empty() {
-        if !compact {
-            body.push(gpu_header(&c, th));
-        }
+        let mut head = gpu_header(&c, th);
+        head.optional = true;
+        body.push(head);
         for g in vis {
             let u = tw.ease((i, g.idx * 4), g.util.unwrap_or(0.0), 0.0);
             let m = tw.ease((i, g.idx * 4 + 1), g.mem_pct(), 0.0);
@@ -733,13 +918,13 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
             } else {
                 th.state[g.state()]
             };
-            body.push(gpu_row(g, h.history.get(&g.idx), &c, th, u, m, dot, &s.me, known));
+            body.push(gpu_row(g, h.history.gpu.get(&g.idx), &c, th, u, m, dot, &s.me, known));
         }
     } else if !s.gpus.is_empty() {
         body.push(line(&format!("all {} GPUs busy", s.gpus.len()), th.dim));
     }
     if st.show_proc && !s.gpus.is_empty() {
-        body.extend(proc_section(s, cw, th, compact));
+        body.extend(proc_section(s, cw, th));
     }
     if let Some(e) = &s.gpu_error {
         body.push(line(&format!("! {e}"), th.warn));
@@ -793,10 +978,12 @@ fn frame_card(left: Line, right: Line, body: Vec<Line>, width: usize, th: &Theme
     let mut out = Vec::with_capacity(body.len() + 2);
     out.push(top_border(left, right, width, th));
     for mut b in body {
+        // framed in place: no new row, no copy of its cells
         b.fit(cw);
-        let mut ln = line("│ ", th.border);
-        ln.extend(&b).add(" │", th.border);
-        out.push(ln);
+        b.cells.splice(0..0, [Cell { ch: '│', st: th.border }, Cell { ch: ' ', st: th.border }]);
+        b.zones.iter_mut().for_each(|z| (z.0, z.1) = (z.0 + 2, z.1 + 2));
+        b.add(" │", th.border);
+        out.push(b);
     }
     out.push(bottom_border(bottom, width, th));
     out
@@ -837,7 +1024,7 @@ fn list_panel(cx: &Ctx, tw: &mut Tweener, snaps: &[Host], order: &[usize], w: us
             let gpus = &s.gpus;
             let idle = gpus.iter().filter(|g| g.state() == 0).count();
             ln.add(&rjust(&format!("{idle}/{}", gpus.len()), 5), if idle > 0 { th.state[0] } else { th.dim });
-            ln.add("  ", PLAIN).add(&rjust(&format!("{:.0}G", free_gib(gpus)), 6), PLAIN).add("  ", PLAIN);
+            ln.add("  ", PLAIN).add(&rjust(&format!("{}G", D0(free_gib(gpus))), 6), PLAIN).add("  ", PLAIN);
             put_strip(&mut ln, gpus.iter().map(|g| g.util), th);
             ln.pad(ng - gpus.len().min(ng) + 2);
             put_strip(&mut ln, gpus.iter().map(|g| Some(g.mem_pct())), th);
@@ -847,7 +1034,7 @@ fn list_panel(cx: &Ctx, tw: &mut Tweener, snaps: &[Host], order: &[usize], w: us
             ln.add(&fmt_pct(rp)[1..], th.level(rp)).add("  ", PLAIN);
             match load_of(s) {
                 Some((l, n)) => {
-                    let (v, r) = (format!("{l:.1}"), format!("/{n}c"));
+                    let (v, r) = (D1(l).to_string(), format!("/{n}c"));
                     ln.pad(11usize.saturating_sub(v.len() + r.len()));
                     ln.add(&v, th.level(Some(l / n as f64 / 1.2 * 100.0))).add(&r, th.dim);
                 }
@@ -868,7 +1055,7 @@ fn list_panel(cx: &Ctx, tw: &mut Tweener, snaps: &[Host], order: &[usize], w: us
                 ln.add(&format!("  ! {e}"), th.warn);
             }
         } else if h.status == Status::Connecting {
-            ln.add(&format!("connecting… {:.0}s", since(cx.now, h.since)), th.dim);
+            ln.add(&format!("connecting… {}s", D0(since(cx.now, h.since))), th.dim);
         } else {
             ln.add(h.error.as_deref().unwrap_or("error"), th.err);
         }
@@ -900,7 +1087,7 @@ fn header_line(cx: &Ctx, snaps: &[Host], w: usize) -> Line {
 
     let summary = |short: bool| {
         let sep = if short { " · " } else { "  ·  " };
-        let mut ln = line(if short { " ◆" } else { " ◆ gpustatus" }, th.accent);
+        let mut ln = line(if short { " ◆" } else { " ◆ rgtop" }, th.accent);
         ln.add(if short { " " } else { "   " }, PLAIN);
         ln.add(&idle.to_string(), if idle > 0 { th.state[0] } else { th.err });
         ln.add(&format!("/{} {}", gpus.len(), if short { "idle" } else { "GPUs idle" }), th.dim);
@@ -960,7 +1147,7 @@ pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt
     let mut sort = Line::default();
     sort.act("← ", th.key, Act::SortPrev).act(st.sort, th.on, Act::SortNext).act(" →", th.key, Act::SortNext);
     let mut interval = Line::default();
-    interval.act("− ", th.key, Act::IntDown).act(&format!("{}ms", st.interval_ms), th.on, Act::IntUp);
+    interval.act("− ", th.key, Act::IntDown).act(&fmt_interval(st.interval_ms), th.on, Act::IntUp);
     interval.act(" +", th.key, Act::IntUp);
     let left = [
         ("sort", sort),
@@ -1019,7 +1206,7 @@ const HELP: &[(&str, &str)] = &[
     ("Keys", ""),
     ("← →   < >", "sort hosts: host · idle · vram · util"),
     ("r", "reverse sort"),
-    ("−  +", "refresh interval, 0.5 s … 60 s (applies instantly)"),
+    ("−  +", "refresh interval ±100 ms, from 100 ms (applies instantly)"),
     ("space   enter", "pause / resume sampling · sample now"),
     ("f", "free only: hide busy GPUs"),
     ("c h u p", "toggle CPU line · util history · GPU user · process list"),
@@ -1082,17 +1269,24 @@ pub struct Frame {
 
 impl Frame {
     /// Content rows with the columns placed side by side, each exactly `w` wide.
-    pub fn rows(&self, w: usize) -> Vec<Line> {
+    /// Takes the columns: the first one's lines become the rows (no copy).
+    pub fn take_rows(&mut self, w: usize) -> Vec<Line> {
         let total = self.cols.iter().map(|c| c.0.len()).max().unwrap_or(0);
+        let mut cols: Vec<_> = std::mem::take(&mut self.cols).into_iter().map(|(c, cw)| (c.into_iter(), cw)).collect();
         (0..total)
-            .map(|y| {
-                let mut row = Line::default();
-                for (col, cw) in &self.cols {
-                    match col.get(y) {
-                        Some(l) => row.extend(l),
-                        None => row.pad(*cw),
+            .map(|_| {
+                let mut row: Option<Line> = None;
+                for (it, cw) in cols.iter_mut() {
+                    let r = match (&mut row, it.next()) {
+                        (Some(r), Some(l)) => r.extend(&l),
+                        (Some(r), None) => r.pad(*cw),
+                        (None, l) => row.insert(l.unwrap_or_else(|| Line::with_capacity(w))),
                     };
+                    if r.w() == 0 {
+                        r.pad(*cw); // this column has no line here
+                    }
                 }
+                let mut row = row.unwrap_or_default();
                 row.fit(w);
                 row
             })
@@ -1130,8 +1324,8 @@ fn order_hosts(snaps: &[Host], st: &Settings) -> Vec<usize> {
 
 /// Card columns. Masonry: each card goes to the currently shortest column, so
 /// a folded or short card never leaves a hole next to a tall one. Too tall for
-/// the screen -> rebuilt compact (no column headers).
-#[allow(clippy::too_many_arguments)]
+/// the screen -> compact: the column-header rows are dropped (each card is
+/// still built only once).
 fn layout_cards(
     cx: &Ctx,
     tw: &mut Tweener,
@@ -1145,25 +1339,39 @@ fn layout_cards(
     let max_cols = (w / CARD_MIN_WIDTH).clamp(1, n);
     let ncols = n.div_ceil(n.div_ceil(max_cols));
     let card_w = (w / ncols).max(24);
-    let build = |tw: &mut Tweener, compact: bool| {
-        let mut cols: Vec<Vec<Line>> = vec![Vec::new(); ncols];
-        let mut tops = vec![None; snaps.len()];
-        for &i in order {
+    let cards: Vec<(usize, Vec<Line>)> = order
+        .iter()
+        .map(|&i| {
             let h = &snaps[i];
             let folded = cx.st.collapsed.contains(&h.name);
             let (l, r, b) = card_title(cx, tw, i, h, folded);
-            let body = card_body(cx, tw, i, h, card_w, folded, compact);
-            let c = (0..ncols).min_by_key(|&c| cols[c].len()).unwrap_or(0);
-            tops[i] = Some(cols[c].len());
-            cols[c].extend(frame_card(l, r, body, card_w, cx.th, b));
-        }
-        (cols, tops)
+            (i, frame_card(l, r, card_body(cx, tw, i, h, card_w, folded), card_w, cx.th, b))
+        })
+        .collect();
+    let height = |lines: &[Line], compact: bool| lines.iter().filter(|l| !(compact && l.optional)).count();
+    let place = |compact: bool| {
+        let mut heights = vec![0; ncols];
+        let spots: Vec<(usize, usize)> = cards
+            .iter()
+            .map(|(_, lines)| {
+                let c = (0..ncols).min_by_key(|&c| heights[c]).unwrap_or(0);
+                let top = heights[c];
+                heights[c] += height(lines, compact);
+                (c, top)
+            })
+            .collect();
+        (spots, heights.into_iter().max().unwrap_or(0))
     };
-    let (mut cols, mut tops) = build(tw, false);
-    if area.is_some_and(|a| cols.iter().map(Vec::len).max().unwrap_or(0) > a) {
-        (cols, tops) = build(tw, true);
+    let (mut spots, tall) = place(false);
+    let compact = area.is_some_and(|a| tall > a);
+    if compact {
+        spots = place(true).0;
     }
-    anchors.copy_from_slice(&tops);
+    let mut cols: Vec<Vec<Line>> = vec![Vec::new(); ncols];
+    for ((i, lines), (c, top)) in cards.into_iter().zip(spots) {
+        anchors[i] = Some(top);
+        cols[c].extend(lines.into_iter().filter(|l| !(compact && l.optional)));
+    }
     cols.into_iter().map(|c| (c, card_w)).collect()
 }
 
@@ -1200,8 +1408,8 @@ impl Renderer {
         paused: bool,
         help_on: bool,
     ) -> Frame {
-        self.tw.begin(dt);
         let iv = st.interval_ms as f64 / 1000.0;
+        self.tw.begin(dt, TWEEN_TAU.min(iv / 3.0)); // settle well before the next sample
         let cx = Ctx {
             th: &self.th,
             st,
@@ -1210,6 +1418,8 @@ impl Renderer {
             live: self.live,
             paused,
             stale_after: (3.0 * iv).max(iv + 8.0),
+            iv,
+            ng: snaps.iter().filter_map(|h| h.sample.as_ref()).map(|s| s.gpus.len()).max().unwrap_or(0),
         };
         let tw = &mut self.tw;
         let order = order_hosts(snaps, st);
@@ -1226,6 +1436,7 @@ impl Renderer {
 
         self.spinning = snaps.iter().any(|h| h.status == Status::Connecting);
         let pulsing = self.live
+            && iv >= 1.0
             && snaps.iter().any(|h| {
                 let age = since(now, h.updated);
                 h.sample.is_some() && h.status == Status::Ok && age < PULSE_SECS
@@ -1248,5 +1459,104 @@ mod tests {
         let mut l = line("a中b", PLAIN);
         l.fit(3); // the wide char can't be split: blank + ellipsis
         assert_eq!(l.cells.iter().map(|c| c.ch).collect::<String>(), "a …");
+        assert_eq!(short_cpu("AMD EPYC 9654 96-Core Processor"), "EPYC 9654");
+        assert_eq!(short_cpu("Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz"), "Xeon Gold 6338");
+    }
+
+    /// Worst case: 5 hosts x 8 GPUs, 192 cores, every panel on, data changing
+    /// every 6th frame (100 ms at 60 fps) so bars never stop easing.
+    /// cargo test --release -- --ignored bench_frame --nocapture
+    #[test]
+    #[ignore]
+    fn bench_frame() {
+        use crate::collect::{History, Proc};
+        use crate::term::{Colors, Screen};
+        let st =
+            Settings { show_user: true, show_hist: true, show_proc: true, interval_ms: 100, ..Settings::default() };
+        let sample = |k: usize| {
+            let gpus: Vec<Gpu> = (0..8)
+                .map(|i| Gpu {
+                    idx: i,
+                    uuid: format!("GPU-{i}"),
+                    name: "NVIDIA H100 80GB HBM3".into(),
+                    util: Some(((i as usize * 37 + k * 13) % 101) as f64),
+                    mem_used: ((i as usize * 7919 + k * 977) % 81559) as f64,
+                    mem_total: 81559.0,
+                    temp: Some(40.0 + i as f64),
+                    power: Some(300.0 + (k % 50) as f64),
+                    power_limit: Some(700.0),
+                    users: vec!["alice".into(), "bob".into()],
+                })
+                .collect();
+            let procs = (0..10)
+                .map(|p| Proc {
+                    pid: 100_000 + p,
+                    user: if p % 2 == 0 { "alice" } else { "bob" }.into(),
+                    etime: Some(3600 * p as u64),
+                    cmd: "/opt/conda/bin/python -m torch.distributed.run --nproc_per_node 8 train.py".into(),
+                    gpus: vec![p % 8],
+                    mem: 20000.0,
+                    cpu: Some(99.0),
+                    rss_kb: Some(12 << 20),
+                })
+                .collect();
+            Sample {
+                gpus,
+                cpu_pct: Some((k % 100) as f64),
+                core_pct: (0..192).map(|c| ((c * 7 + k) % 100) as f32).collect(),
+                cpu_temp: Some(45.0),
+                cpu_model: "INTEL(R) XEON(R) PLATINUM 8558".into(),
+                sockets: 2,
+                load: Some([30.0, 28.0, 27.0]),
+                cores: Some(192),
+                mem_total_kb: 2 << 31,
+                mem_avail_kb: 1 << 31,
+                mem_cache_kb: 1 << 30,
+                swap_total_kb: 16 << 20,
+                swap_free_kb: 15 << 20,
+                uptime: Some(4e6),
+                procs: Some(procs),
+                host_users: vec![("alice".into(), 1840.0, 40 << 20), ("bob".into(), 900.0, 20 << 20)],
+                me: "alice".into(),
+                ..Sample::default()
+            }
+        };
+        let mut hist = History::default();
+        hist.cpu = (0..240).map(|v| (v % 100) as f32).collect();
+        hist.gpu = (0..8).map(|i| (i, (0..240).map(|v| ((v + i) % 100) as f32).collect())).collect();
+        let hist = std::sync::Arc::new(hist);
+        let mut hosts: Vec<Host> = (0..5)
+            .map(|h| {
+                let mut x = Host::new(&format!("gpu-node-{h}"));
+                (x.status, x.history, x.latency) = (Status::Ok, hist.clone(), Some(0.045));
+                x
+            })
+            .collect();
+        let (w, ht) = (200, 60);
+        let mut r = Renderer::new(Theme::new("dark"), true, String::new());
+        let mut screen = Screen::new(Colors::True);
+        let t0 = Instant::now();
+        let frames = std::env::var("RGTOP_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1200);
+        let mut bytes = 0;
+        for f in 0..frames {
+            if f % 6 == 0 {
+                let s = std::sync::Arc::new(sample(f / 6));
+                for x in &mut hosts {
+                    (x.sample, x.updated) = (Some(s.clone()), Instant::now());
+                }
+            }
+            let now = Instant::now();
+            let mut fr = r.frame(&hosts, &st, w, Some(ht - 2), now, Some(1.0 / FPS), false, false);
+            let rows: Vec<Vec<Cell>> =
+                std::iter::once(fr.header.clone()).chain(fr.take_rows(w)).take(ht).map(|l| l.cells).collect();
+            bytes += screen.diff(rows, w, ht).len();
+        }
+        let per = t0.elapsed().as_secs_f64() / frames as f64;
+        println!(
+            "bench_frame: {:.1} us/frame ({:.2}% of a core at {FPS} fps), {} bytes/frame",
+            per * 1e6,
+            per * FPS * 100.0,
+            bytes / frames
+        );
     }
 }

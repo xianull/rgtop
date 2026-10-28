@@ -1,10 +1,10 @@
 [package]
-name = "gpustatus"
-version = "3.0.2"
+name = "rgtop"
+version = "4.0.0"
 edition = "2024"
 description = "btop-style live GPU/CPU dashboard for remote NVIDIA servers over SSH"
 license = "MIT"
-repository = "https://github.com/xianull/gpustatus"
+repository = "https://github.com/xianull/rgtop"
 keywords = ["gpu", "nvidia", "monitoring", "tui", "ssh"]
 categories = ["command-line-utilities"]
 

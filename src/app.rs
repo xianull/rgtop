@@ -2,11 +2,11 @@
 //! frame pacing, scrolling.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::collect::{Worker, supervise};
+use crate::collect::{DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, supervise};
 use crate::draw::{FPS, Line, Renderer, footer_line};
 use crate::settings::{SORTS, Settings, THEMES, VIEWS, step_interval};
 use crate::term::{self, Screen};
@@ -217,6 +217,18 @@ fn next(of: &[&'static str], cur: &str, by: isize) -> &'static str {
     of[(i + by).rem_euclid(of.len() as isize) as usize]
 }
 
+/// What to ask the agents for: the process list also shows the host's top
+/// CPU users; the USER column needs only the GPU processes.
+pub fn want_level(st: &Settings) -> u8 {
+    if st.show_proc {
+        WANT_HOST
+    } else if st.show_user {
+        WANT_PROCS
+    } else {
+        WANT_SYS
+    }
+}
+
 // ── app ──────────────────────────────────────────────────────────────────────
 pub struct App {
     pub st: Settings,
@@ -224,7 +236,7 @@ pub struct App {
     names: Vec<String>,
     renderer: Renderer,
     rx: Receiver<Msg>,
-    want_procs: Arc<AtomicBool>,
+    want: Arc<AtomicU8>,
     auto_theme: &'static str,
     hard: f64,
     screen: Screen,
@@ -237,6 +249,7 @@ pub struct App {
     area: usize,
     next_tick: Instant,
     quit: bool,
+    size: (usize, usize), // cached: re-read on SIGWINCH, not every frame (ioctl)
 }
 
 impl App {
@@ -246,7 +259,7 @@ impl App {
         workers: Vec<Arc<Worker>>,
         renderer: Renderer,
         rx: Receiver<Msg>,
-        want_procs: Arc<AtomicBool>,
+        want: Arc<AtomicU8>,
         auto_theme: &'static str,
         hard: f64,
     ) -> Self {
@@ -257,7 +270,7 @@ impl App {
             names,
             renderer,
             rx,
-            want_procs,
+            want,
             auto_theme,
             hard,
             screen: Screen::new(term::detect_colors()),
@@ -270,6 +283,7 @@ impl App {
             area: 1,
             next_tick: Instant::now(),
             quit: false,
+            size: term::size(),
         }
     }
 
@@ -358,7 +372,7 @@ impl App {
                 let on = if a == Act::User { &mut st.show_user } else { &mut st.show_proc };
                 *on = !*on;
                 let on = *on;
-                self.want_procs.store(st.show_proc || st.show_user, SeqCst);
+                self.want.store(want_level(st), SeqCst);
                 if on {
                     self.sample_now(); // fetch process info right away
                 }
@@ -408,17 +422,17 @@ impl App {
 
     // main loop ---------------------------------------------------------------
     fn build(&mut self, now: Instant, dt: Option<f64>) {
-        let (w, h) = term::size();
+        let (w, h) = self.size;
         let area = h.saturating_sub(2).max(1);
         self.area = area;
         let snaps: Vec<_> = self.workers.iter().map(|w| w.host.lock().unwrap().clone()).collect();
-        let fr = self.renderer.frame(&snaps, &self.st, w, Some(area), now, dt, self.paused, self.help_on);
+        let mut fr = self.renderer.frame(&snaps, &self.st, w, Some(area), now, dt, self.paused, self.help_on);
         self.order.clone_from(&fr.order);
         if let Some(y) = self.goto.and_then(|g| fr.anchors.get(g).copied().flatten()) {
             self.scroll = y as isize;
             self.goto = None;
         }
-        let mut rows = fr.rows(w);
+        let mut rows = fr.take_rows(w);
         let total = rows.len();
         self.scroll = self.scroll.clamp(0, total.saturating_sub(area) as isize);
         let s0 = self.scroll as usize;
@@ -443,6 +457,7 @@ impl App {
         term::restore();
         let _ = signal_hook::low_level::emulate_default_handler(libc::SIGTSTP);
         term::cbreak();
+        self.size = term::size(); // may have changed while we were stopped
         self.screen.enter(self.st.mouse);
     }
 
@@ -457,33 +472,52 @@ impl App {
             let now = Instant::now();
             supervise(&self.workers, now, self.hard);
             self.schedule(now);
+            let seen = DATA_GEN.load(SeqCst);
             self.build(now, Some(now.duration_since(last).as_secs_f64().min(1.5 / FPS)));
             last = now;
+            UI_BUSY.store(self.renderer.animating, SeqCst);
+            if !self.renderer.animating && DATA_GEN.load(SeqCst) != seen {
+                continue; // a host changed while we built and didn't wake us: draw it now
+            }
 
-            // animate at FPS; otherwise sleep until the next spinner glyph or the
-            // clock's next second, and never past the next sample
-            let mut wake = if self.renderer.animating {
-                (now + frame).saturating_duration_since(Instant::now())
+            // the next frame of its own: at FPS while animating, else at the next
+            // spinner glyph or the clock's next second
+            let redraw_at = if self.renderer.animating {
+                now + frame
             } else {
                 let to_second =
                     1.0 - SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64().fract() + 0.01;
                 let secs = if self.renderer.spinning { self.renderer.spinner_in(now) } else { to_second };
-                Duration::from_secs_f64(secs.min(to_second))
+                now + Duration::from_secs_f64(secs.min(to_second))
             };
-            if !self.paused {
-                wake = wake.min(self.next_tick.saturating_duration_since(now) + Duration::from_millis(1));
-            }
-            if !pending.is_empty() {
-                wake = wake.min(Duration::from_millis(50));
-            }
-
+            let esc_at = pending_t + Duration::from_millis(50);
             let mut msgs = Vec::new();
-            match self.rx.recv_timeout(wake) {
-                Ok(m) => msgs.push(m),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            loop {
+                let mut until = redraw_at;
+                if !self.paused {
+                    until = until.min(self.next_tick);
+                }
+                if !pending.is_empty() {
+                    until = until.min(esc_at);
+                }
+                match self.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    Ok(m) => {
+                        msgs.push(m);
+                        msgs.extend(self.rx.try_iter());
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                let t = Instant::now();
+                self.schedule(t); // sample requests go out on time without forcing a redraw
+                // keys and signals: now. New data: now if idle, else with the next
+                // animation frame (5 hosts at 100 ms would otherwise add 50 frames/s)
+                let urgent =
+                    msgs.iter().any(|m| !matches!(m, Msg::Data)) || (!msgs.is_empty() && !self.renderer.animating);
+                if urgent || t >= redraw_at || (!pending.is_empty() && t >= esc_at) {
+                    break;
+                }
             }
-            msgs.extend(self.rx.try_iter()); // coalesce bursts into one frame
             let mut got_input = false;
             for m in msgs {
                 match m {
@@ -493,7 +527,7 @@ impl App {
                         (pending_t, got_input) = (Instant::now(), true);
                     }
                     Msg::InputEof => return,
-                    Msg::Signal(libc::SIGWINCH) => {}
+                    Msg::Signal(libc::SIGWINCH) => self.size = term::size(),
                     Msg::Signal(libc::SIGTSTP) => self.suspend(),
                     Msg::Signal(_) => return, // INT / TERM / HUP: quit, settings still saved
                 }

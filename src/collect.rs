@@ -1,15 +1,17 @@
 //! Remote sampling over SSH.
 //!
-//! Each host gets ONE long-lived SSH session running a small POSIX-sh loop. Every
-//! request line written to its stdin produces exactly one sample frame on stdout,
-//! so the local side decides when to sample: the refresh interval can change
-//! instantly, pausing costs nothing, and no sample ever pays for a new handshake.
+//! Each host gets ONE long-lived SSH session running a small agent (agent.py,
+//! or agent.sh where there is no python3). Every request line written to its
+//! stdin produces exactly one sample frame on stdout, so the local side decides
+//! when to sample: the refresh interval can change instantly, pausing costs
+//! nothing, and no sample ever pays for a new handshake. agent.py reads GPUs
+//! through NVML and /proc in-process, so a sample forks nothing remotely.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,50 +20,35 @@ use crate::app::Msg;
 
 static SPAWN: Mutex<()> = Mutex::new(());
 
-pub const HISTORY: usize = 240; // util samples kept per GPU for the sparkline
+/// Bumped on every host change. While the UI is animating (UI_BUSY) it redraws
+/// within a frame anyway, so workers skip the wake-up: with 5 hosts at 100 ms
+/// that is 50 needless wake-ups a second. Before sleeping, the UI clears
+/// UI_BUSY and re-checks DATA_GEN, so no change is missed.
+pub static DATA_GEN: AtomicU64 = AtomicU64::new(0);
+pub static UI_BUSY: AtomicBool = AtomicBool::new(false);
+
+pub const HISTORY: usize = 240; // history points kept per GPU / CPU for the sparklines
+const BUCKET: Duration = Duration::from_millis(950); // samples closer than this share one point (max)
 const IDLE_PCT: f64 = 5.0; // util AND mem below this -> idle  (green)
 const LIGHT_PCT: f64 = 40.0; // util AND mem below this -> light (yellow), otherwise busy (red)
 pub const UNKNOWN: &str = "?"; // owner of a GPU process whose PID isn't visible on the host
 
-const GPU_FIELDS: &str = "index,uuid,name,utilization.gpu,memory.used,memory.total,\
-                          temperature.gpu,power.draw,power.limit";
+/// What each request asks the agent for.
+pub const WANT_SYS: u8 = 0; // system + GPUs
+pub const WANT_PROCS: u8 = 1; // + GPU processes (USER column)
+pub const WANT_HOST: u8 = 2; // + top CPU users of the host (process list)
 
-// dash-compatible. Request "s" = system + GPUs, "p" = also per-GPU processes.
-// Every non-GPU line is tagged @@x so shell-rc noise can't be mistaken for data.
-const REMOTE: &str = r#"
-export LC_ALL=C
-n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)
-me=$(id -un 2>/dev/null)
-command -v nvidia-smi >/dev/null 2>&1 || nosmi=1
-while read -r req; do
-  echo @@B
-  echo "@@S $(head -n1 /proc/stat 2>/dev/null)"
-  if [ -z "$nosmi" ]; then
-    nvidia-smi --query-gpu=@FIELDS@ --format=csv,noheader,nounits 2>&1
-    echo "@@G $?"
-  else
-    echo "@@G 127"
-  fi
-  echo "@@S $(head -n1 /proc/stat 2>/dev/null)"
-  echo "@@L $(cat /proc/loadavg 2>/dev/null)"
-  echo "@@M $(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print t+0, a+0}' /proc/meminfo 2>/dev/null)"
-  echo "@@N $n"
-  echo "@@U $me"
-  if [ "$req" = p ] && [ -z "$nosmi" ]; then
-    echo @@X
-    apps=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits 2>/dev/null)
-    if [ -n "$apps" ]; then
-      printf '%s\n' "$apps" | sed 's/^/@@A /'
-      pids=$(printf '%s\n' "$apps" | awk -F', *' '$2 ~ /^[0-9]+$/ {print $2}' | sort -u | paste -sd, -)
-      [ -n "$pids" ] && ps -o pid= -o user:32= -o etimes= -o args= -p "$pids" 2>/dev/null | cut -c1-300 | sed 's/^/@@P /'
-    fi
-  fi
-  echo @@E
-done
-"#;
+const AGENT_PY: &str = include_str!("agent.py");
+const AGENT_SH: &str = include_str!("agent.sh");
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r#"'"'"'"#))
+}
 
 pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
-    let script = REMOTE.replace("@FIELDS@", GPU_FIELDS);
+    // python3 -I -S: no user site / PYTHONPATH / sitecustomize; just the stdlib
+    let launcher = format!("command -v python3 >/dev/null 2>&1 && exec python3 -I -S -c \"$1\"\n{AGENT_SH}");
+    let remote = format!("sh -c {} rgtop {}", sh_quote(&launcher), sh_quote(AGENT_PY));
     let mut v: Vec<String> = ["ssh", "-T", "-x", "-a"].map(String::from).to_vec();
     for o in [
         "BatchMode=yes".to_string(),
@@ -77,7 +64,7 @@ pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
         v.push("-o".into());
         v.push(o);
     }
-    v.extend(["--".into(), host.into(), format!("sh -c '{}'", script.replace('\'', r#"'"'"'"#))]);
+    v.extend(["--".into(), host.into(), remote]);
     v
 }
 
@@ -121,25 +108,36 @@ pub struct Proc {
     pub etime: Option<u64>, // seconds since start
     pub cmd: String,
     pub gpus: Vec<u32>,
-    pub mem: f64, // MiB, summed over its GPUs
+    pub mem: f64,            // MiB, summed over its GPUs
+    pub cpu: Option<f64>,    // current %CPU (100 = one core); agent.py only
+    pub rss_kb: Option<u64>, // host memory; agent.py only
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Sample {
     pub gpus: Vec<Gpu>,
     pub gpu_error: Option<String>,
     pub cpu_pct: Option<f64>,
+    pub core_pct: Vec<f32>, // per logical core; empty from agent.sh
+    pub cpu_temp: Option<f64>,
+    pub cpu_model: String,
+    pub sockets: u32,
     pub load: Option<[f64; 3]>,
     pub cores: Option<u32>,
     pub mem_total_kb: u64,
     pub mem_avail_kb: u64,
-    pub stat: Option<(u64, u64)>, // (total, idle) jiffies at the end of the frame
-    pub procs: Option<Vec<Proc>>, // None = processes weren't requested
-    pub me: String,               // remote login user
+    pub mem_cache_kb: u64,
+    pub swap_total_kb: u64,
+    pub swap_free_kb: u64,
+    pub uptime: Option<f64>,
+    pub stat: Option<(u64, u64)>,            // (total, idle) jiffies at the end of the frame
+    pub procs: Option<Vec<Proc>>,            // None = processes weren't requested
+    pub host_users: Vec<(String, f64, u64)>, // top CPU users of the host: (user, %CPU, RSS kB)
+    pub me: String,                          // remote login user
 }
 
 fn num(s: &str) -> Option<f64> {
-    s.parse().ok() // "[N/A]", "[Not Supported]", ... -> None
+    s.trim().parse().ok().filter(|v: &f64| v.is_finite()) // "[N/A]", "[Not Supported]", ... -> None
 }
 
 fn digits(s: &str) -> bool {
@@ -177,14 +175,19 @@ fn fields(s: &str, n: usize) -> Vec<&str> {
     out
 }
 
+fn u64s<const N: usize>(rest: &str) -> Option<[u64; N]> {
+    let v: Vec<u64> = rest.split_whitespace().take(N).map_while(|x| x.parse().ok()).collect();
+    v.try_into().ok()
+}
+
 pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
-    let mut gpus = Vec::new();
+    let mut s = Sample { sockets: 1, ..Sample::default() };
     let mut junk: Vec<&str> = Vec::new();
     let mut stats: Vec<Option<(u64, u64)>> = Vec::new();
     let mut apps: Vec<(&str, u32, Option<f64>)> = Vec::new();
     let mut pinfo: HashMap<u32, (&str, Option<u64>, &str)> = HashMap::new();
-    let (mut rc, mut load, mut cores, mut mem_t, mut mem_a, mut me, mut want) =
-        (0i32, None, None, 0u64, 0u64, "", false);
+    let mut qinfo: HashMap<u32, (Option<f64>, Option<u64>)> = HashMap::new();
+    let (mut rc, mut want) = (0i32, false);
     for line in lines {
         if let Some(tagged) = line.strip_prefix("@@") {
             let (tag, rest) = tagged.split_once(' ').unwrap_or((tagged, ""));
@@ -192,17 +195,32 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                 "S" => stats.push(parse_stat(rest)),
                 "G" => rc = rest.trim().parse().unwrap_or(rc),
                 "L" => {
-                    let t: Vec<f64> = rest.split_whitespace().take(3).map_while(|x| x.parse().ok()).collect();
-                    load = (t.len() == 3).then(|| [t[0], t[1], t[2]]);
+                    let t: Vec<f64> = rest.split_whitespace().take(3).map_while(num).collect();
+                    s.load = t.try_into().ok();
                 }
                 "M" => {
-                    let v: Vec<u64> = rest.split_whitespace().take(2).map_while(|x| x.parse().ok()).collect();
-                    if v.len() == 2 {
-                        (mem_t, mem_a) = (v[0], v[1]);
+                    if let Some([t, a]) = u64s(rest) {
+                        (s.mem_total_kb, s.mem_avail_kb) = (t, a);
                     }
                 }
-                "N" => cores = rest.trim().parse().ok(),
-                "U" => me = rest.trim(),
+                "W" => {
+                    if let Some([c, st, sf]) = u64s(rest) {
+                        (s.mem_cache_kb, s.swap_total_kb, s.swap_free_kb) = (c, st, sf);
+                    }
+                }
+                "N" => s.cores = rest.trim().parse().ok(),
+                "U" => s.me = rest.trim().into(),
+                "C" => {
+                    s.core_pct =
+                        rest.trim().chars().map(|c| c.to_digit(36).unwrap_or(0) as f32 * 100.0 / 35.0).collect()
+                }
+                "T" => s.cpu_temp = num(rest),
+                "O" => s.uptime = num(rest),
+                "I" => {
+                    let (n, model) = rest.split_once(' ').unwrap_or((rest, ""));
+                    s.sockets = n.parse().unwrap_or(1).max(1);
+                    s.cpu_model = model.trim().into();
+                }
                 "X" => want = true,
                 "A" => {
                     let p: Vec<&str> = rest.split(',').map(str::trim).collect();
@@ -222,6 +240,18 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                         pinfo.insert(pid, (f[1], f[2].parse().ok(), f.get(3).copied().unwrap_or("")));
                     }
                 }
+                "Q" => {
+                    if let [pid, cpu, rss] = fields(rest, 3)[..]
+                        && let Ok(pid) = pid.parse()
+                    {
+                        qinfo.insert(pid, (num(cpu), rss.parse().ok()));
+                    }
+                }
+                "H" => {
+                    if let [user, cpu, rss] = fields(rest, 3)[..] {
+                        s.host_users.push((user.into(), num(cpu).unwrap_or(0.0), rss.parse().unwrap_or(0)));
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -229,7 +259,7 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
         let row: Vec<&str> = line.split(',').map(str::trim).collect();
         if row.len() >= 9 && digits(row[0]) {
             let n = &row[row.len() - 6..];
-            gpus.push(Gpu {
+            s.gpus.push(Gpu {
                 idx: row[0].parse().unwrap_or(0),
                 uuid: row[1].into(),
                 name: row[2..row.len() - 6].join(", "),
@@ -246,8 +276,9 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
         }
     }
 
-    let gpu_error = if rc == 127 && gpus.is_empty() {
-        Some("nvidia-smi not found".to_string())
+    let gpus = &mut s.gpus;
+    s.gpu_error = if rc == 127 && gpus.is_empty() {
+        Some("no NVIDIA driver (NVML / nvidia-smi not found)".to_string())
     } else if rc != 0 || !junk.is_empty() || gpus.is_empty() {
         Some(match junk.first() {
             Some(j) => j.to_string(),
@@ -258,12 +289,12 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
         None
     };
 
-    let end = stats.last().copied().flatten();
-    // whole interval since the last frame; first frame: the span of nvidia-smi
-    let cpu_pct = busy(prev_stat, end).or_else(|| busy(stats.first().copied().flatten(), end));
+    s.stat = stats.last().copied().flatten();
+    // whole interval since the last frame; first frame: the span inside the agent
+    s.cpu_pct = busy(prev_stat, s.stat).or_else(|| busy(stats.first().copied().flatten(), s.stat));
     gpus.sort_by_key(|g| g.idx);
 
-    let procs = if want {
+    if want {
         let by_uuid: HashMap<&str, u32> = gpus.iter().map(|g| (g.uuid.as_str(), g.idx)).collect();
         let mut agg: HashMap<u32, (Proc, BTreeSet<u32>)> = HashMap::new();
         let mut per_gpu: HashMap<u32, Vec<(String, f64)>> = HashMap::new();
@@ -280,7 +311,7 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                     None => d.push((user.into(), m)),
                 }
             }
-            // nvidia-smi "[Not Found]": other PID namespace, or exited without
+            // not visible on the host: other PID namespace, or exited without
             // releasing its memory -> one summary row
             let Some(&(u, etime, cmd)) = info else {
                 hidden_n += 1;
@@ -289,7 +320,9 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                 continue;
             };
             let e = agg.entry(pid).or_insert_with(|| {
-                (Proc { pid, user: u.into(), etime, cmd: cmd.into(), gpus: Vec::new(), mem: 0.0 }, BTreeSet::new())
+                let (cpu, rss_kb) = qinfo.get(&pid).copied().unwrap_or((None, None));
+                let p = Proc { pid, user: u.into(), etime, cmd: cmd.into(), gpus: Vec::new(), mem: 0.0, cpu, rss_kb };
+                (p, BTreeSet::new())
             });
             e.0.mem += m;
             e.1.extend(idx);
@@ -308,12 +341,13 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                 user: UNKNOWN.into(),
                 etime: None,
                 cmd: format!(
-                    "{hidden_n} process{} not visible here (other container, or exited \
-                              without freeing VRAM)",
+                    "{hidden_n} process{} not visible here (other container, or exited without freeing VRAM)",
                     if hidden_n > 1 { "es" } else { "" }
                 ),
                 gpus: hidden_gpus.into_iter().collect(),
                 mem: hidden_mem,
+                cpu: None,
+                rss_kb: None,
             });
         }
         for g in gpus.iter_mut() {
@@ -323,22 +357,9 @@ pub fn parse_frame(lines: &[String], prev_stat: Option<(u64, u64)>) -> Sample {
                 g.users = d.iter().map(|e| e.0.clone()).collect();
             }
         }
-        Some(procs)
-    } else {
-        None
-    };
-    Sample {
-        gpus,
-        gpu_error,
-        cpu_pct,
-        load,
-        cores,
-        mem_total_kb: mem_t,
-        mem_avail_kb: mem_a,
-        stat: end,
-        procs,
-        me: me.into(),
+        s.procs = Some(procs);
     }
+    s
 }
 
 // ── per-host state ───────────────────────────────────────────────────────────
@@ -349,7 +370,41 @@ pub enum Status {
     Error,
 }
 
-/// Shared between a host's worker thread (writer) and the UI (clones a copy per frame).
+/// Utilization history. One point per BUCKET (the max of the samples in it),
+/// so a sparkline spans the same time whether sampling every 100 ms or 1 s.
+#[derive(Clone, Default)]
+pub struct History {
+    pub gpu: BTreeMap<u32, VecDeque<f32>>,
+    pub cpu: VecDeque<f32>,
+    bucket: Option<Instant>,
+}
+
+impl History {
+    fn push(&mut self, s: &Sample, now: Instant) {
+        let fresh = self.bucket.is_none_or(|t| now.duration_since(t) >= BUCKET);
+        if fresh {
+            self.bucket = Some(now);
+        }
+        let put = |q: &mut VecDeque<f32>, v: f32| match q.back_mut() {
+            Some(last) if !fresh => *last = last.max(v),
+            _ => {
+                if q.len() == HISTORY {
+                    q.pop_front();
+                }
+                q.push_back(v);
+            }
+        };
+        for g in &s.gpus {
+            put(self.gpu.entry(g.idx).or_default(), g.util.unwrap_or(0.0) as f32);
+        }
+        if let Some(c) = s.cpu_pct {
+            put(&mut self.cpu, c as f32);
+        }
+    }
+}
+
+/// Written by the host's worker thread; the UI clones it every frame, which is
+/// cheap: the sample and the history are behind Arcs.
 #[derive(Clone)]
 pub struct Host {
     pub name: String,
@@ -360,7 +415,7 @@ pub struct Host {
     pub sample: Option<Arc<Sample>>,
     pub updated: Instant,
     pub latency: Option<f64>, // request -> frame round trip of the last sample
-    pub history: BTreeMap<u32, VecDeque<f32>>,
+    pub history: Arc<History>,
 }
 
 impl Host {
@@ -375,7 +430,7 @@ impl Host {
             sample: None,
             updated: now,
             latency: None,
-            history: BTreeMap::new(),
+            history: Arc::default(),
         }
     }
 
@@ -389,15 +444,10 @@ impl Host {
     }
 
     fn push(&mut self, s: Sample, latency: Option<f64>) {
-        for g in &s.gpus {
-            let h = self.history.entry(g.idx).or_default();
-            if h.len() == HISTORY {
-                h.pop_front();
-            }
-            h.push_back(g.util.unwrap_or(0.0) as f32);
-        }
+        let now = Instant::now();
+        Arc::make_mut(&mut self.history).push(&s, now); // copies only if the UI still holds the old one
         (self.sample, self.status, self.error, self.retry_at) = (Some(Arc::new(s)), Status::Ok, None, None);
-        (self.updated, self.latency) = (Instant::now(), latency);
+        (self.updated, self.latency) = (now, latency);
     }
 }
 
@@ -411,7 +461,7 @@ pub struct Worker {
     once: bool,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
-    want_procs: Arc<AtomicBool>,
+    want: Arc<AtomicU8>,                              // WANT_*
     io: Mutex<(Option<ChildStdin>, Option<Instant>)>, // (request pipe, request sent at)
     pid: AtomicI32,
     kill_reason: Mutex<Option<String>>,
@@ -425,7 +475,7 @@ impl Worker {
         once: bool,
         tx: Sender<Msg>,
         stop: Arc<AtomicBool>,
-        want_procs: Arc<AtomicBool>,
+        want: Arc<AtomicU8>,
     ) -> Self {
         Worker {
             host: Arc::new(Mutex::new(Host::new(name))),
@@ -433,7 +483,7 @@ impl Worker {
             once,
             tx,
             stop,
-            want_procs,
+            want,
             io: Mutex::new((None, None)),
             pid: AtomicI32::new(0),
             kill_reason: Mutex::new(None),
@@ -442,7 +492,10 @@ impl Worker {
     }
 
     fn notify(&self) {
-        let _ = self.tx.send(Msg::Data);
+        DATA_GEN.fetch_add(1, SeqCst);
+        if !UI_BUSY.load(SeqCst) {
+            let _ = self.tx.send(Msg::Data);
+        }
     }
 
     pub fn request(&self) -> bool {
@@ -451,7 +504,11 @@ impl Worker {
             return false;
         }
         let Some(stdin) = io.0.as_mut() else { return false };
-        let req = if self.want_procs.load(SeqCst) { b"p\n" } else { b"s\n" };
+        let req: &[u8] = match self.want.load(SeqCst) {
+            WANT_HOST => b"h\n",
+            WANT_PROCS => b"p\n",
+            _ => b"s\n",
+        };
         if stdin.write_all(req).and_then(|_| stdin.flush()).is_err() {
             return false;
         }
@@ -609,14 +666,23 @@ mod tests {
 @@S cpu  200 0 200 1400 200 0 0 0 0 0
 @@L 30.10 28.00 27.50 3/2000 12345
 @@M 2113798144 1826000000
+@@W 900000000 16777212 16518996
 @@N 192
 @@U alice
+@@C 0z0h
+@@T 43
+@@O 3542400.12
+@@I 2 INTEL(R) XEON(R) PLATINUM 8558
 @@X
 @@A GPU-a, 4242, 30000
 @@A GPU-a, 77, 10000
 @@A GPU-b, 99, 500
 @@P   4242 bob       3725 /opt/conda/bin/python train.py --lr 3e-4
-@@P     77 alice       12 python eval.py";
+@@Q 4242 99.5 12345678
+@@P     77 alice       12 python eval.py
+@@Q 77 - 2048
+@@H bob 1840 38386560
+@@H alice 33 1024";
         let lines: Vec<String> = raw.lines().map(String::from).collect();
         let s = parse_frame(&lines, None);
         assert_eq!(s.gpu_error, None);
@@ -626,23 +692,56 @@ mod tests {
         assert_eq!(s.gpus[1].power, None);
         assert_eq!(s.cpu_pct, Some(20.0)); // 200 busy of 1000 jiffies between the @@S lines
         assert_eq!((s.cores, s.me.as_str()), (Some(192), "alice"));
+        assert_eq!(s.core_pct, [0.0, 100.0, 0.0, 17.0 * 100.0 / 35.0]);
+        assert_eq!((s.cpu_temp, s.sockets, s.cpu_model.as_str()), (Some(43.0), 2, "INTEL(R) XEON(R) PLATINUM 8558"));
+        assert_eq!((s.mem_cache_kb, s.swap_total_kb, s.swap_free_kb), (900000000, 16777212, 16518996));
+        assert_eq!(s.host_users[0], ("bob".to_string(), 1840.0, 38386560));
         assert_eq!(s.gpus[0].users, ["bob", "alice"]);
         assert_eq!(s.gpus[1].users, [UNKNOWN]);
         let p = s.procs.unwrap();
         assert_eq!(p.len(), 3);
         assert_eq!(
-            (p[0].pid, p[0].etime, p[0].cmd.as_str()),
-            (4242, Some(3725), "/opt/conda/bin/python train.py --lr 3e-4")
+            (p[0].pid, p[0].etime, p[0].cmd.as_str(), p[0].cpu, p[0].rss_kb),
+            (4242, Some(3725), "/opt/conda/bin/python train.py --lr 3e-4", Some(99.5), Some(12345678))
         );
+        assert_eq!((p[1].cpu, p[1].rss_kb), (None, Some(2048)));
         assert_eq!((p[2].pid, p[2].gpus.as_slice()), (0, [1].as_slice())); // hidden-process summary
     }
 
     #[test]
-    fn missing_smi_and_noise() {
+    fn missing_driver_and_errors() {
         let err = "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.";
         let lines: Vec<String> = [err, "@@G 9"].map(String::from).to_vec();
         assert_eq!(parse_frame(&lines, None).gpu_error.as_deref(), Some(err));
         let lines: Vec<String> = ["@@G 127".to_string()].to_vec();
-        assert_eq!(parse_frame(&lines, None).gpu_error.as_deref(), Some("nvidia-smi not found"));
+        assert!(parse_frame(&lines, None).gpu_error.unwrap().starts_with("no NVIDIA driver"));
+    }
+
+    #[test]
+    fn history_buckets_fast_samples() {
+        let mut h = History::default();
+        let t = Instant::now();
+        let s = |u: f64| Sample { gpus: vec![Gpu { util: Some(u), ..gpu() }], cpu_pct: Some(u), ..Sample::default() };
+        h.push(&s(10.0), t);
+        h.push(&s(70.0), t + Duration::from_millis(100)); // same bucket: max
+        h.push(&s(20.0), t + Duration::from_millis(200));
+        h.push(&s(5.0), t + Duration::from_millis(1000)); // next bucket
+        assert_eq!(h.gpu[&0], [70.0, 5.0]);
+        assert_eq!(h.cpu, [70.0, 5.0]);
+    }
+
+    fn gpu() -> Gpu {
+        Gpu {
+            idx: 0,
+            uuid: String::new(),
+            name: String::new(),
+            util: None,
+            mem_used: 0.0,
+            mem_total: 0.0,
+            temp: None,
+            power: None,
+            power_limit: None,
+            users: Vec::new(),
+        }
     }
 }

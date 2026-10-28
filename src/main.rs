@@ -1,4 +1,4 @@
-//! gpustatus: btop-style live GPU/CPU dashboard for remote servers over SSH.
+//! rgtop: btop-style live GPU/CPU dashboard for remote servers over SSH.
 
 mod app;
 mod collect;
@@ -9,14 +9,14 @@ mod theme;
 
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use app::{App, Msg};
+use app::{App, Msg, want_level};
 use collect::{Worker, ssh_command, supervise};
 use draw::{FPS, Renderer};
-use settings::{Settings, THEMES, choice, config_dir, load_settings, save_settings};
+use settings::{Settings, THEMES, choice, config_dir, config_file, load_settings, save_settings};
 use theme::{Theme, detect_theme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,16 +34,17 @@ fn usage() -> String {
     let cfg = config_dir().display().to_string();
     format!(
         "\
-gpustatus {VERSION}: btop-style live GPU/CPU dashboard for remote servers over SSH.
+rgtop {VERSION}: btop-style live GPU/CPU dashboard for remote servers over SSH.
 Press ? inside the dashboard for keys.
 
-usage: gpustatus [options] [HOST ...]
+usage: rgtop [options] [HOST ...]
 
-  HOST              ssh host aliases (default: $GPUSTATUS_HOSTS, else {cfg}/hosts)
+  HOST              ssh host aliases (default: $RGTOP_HOSTS, else {cfg}/hosts)
   -1, --once        print one snapshot and exit (implied when stdout is not a terminal)
-  -n, --interval S  refresh interval in seconds; adjustable live with -/+ (default: saved, else 2)
+  -n, --interval S  refresh interval in seconds, from 0.1; -/+ adjust it live by 100 ms
+                    (default: saved, else 2)
   -t, --timeout S   SSH connect timeout in seconds (default: 8)
-      --theme T     auto | dark | light (default: saved, else $GPUSTATUS_THEME, else auto)
+      --theme T     auto | dark | light (default: saved, else $RGTOP_THEME, else auto)
       --reset       start from default settings (overwrites {cfg}/settings.json on exit)
   -V, --version     print the version
   -h, --help        print this help
@@ -88,7 +89,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--reset" => a.reset = true,
             "-V" | "--version" => {
-                println!("gpustatus {VERSION}");
+                println!("rgtop {VERSION}");
                 std::process::exit(0);
             }
             "-h" | "--help" => {
@@ -101,18 +102,18 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// $RGTOP_<name>, else the variable from before the rename ($GPUSTATUS_<name>).
+fn env(name: &str) -> Option<String> {
+    std::env::var(format!("RGTOP_{name}")).or_else(|_| std::env::var(format!("GPUSTATUS_{name}"))).ok()
+}
+
 fn load_hosts(cli: Vec<String>) -> Vec<String> {
     let mut hosts = cli;
     if hosts.is_empty() {
-        hosts = std::env::var("GPUSTATUS_HOSTS")
-            .unwrap_or_default()
-            .replace(',', " ")
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        hosts = env("HOSTS").unwrap_or_default().replace(',', " ").split_whitespace().map(String::from).collect();
     }
     if hosts.is_empty()
-        && let Ok(text) = std::fs::read_to_string(config_dir().join("hosts"))
+        && let Ok(text) = std::fs::read_to_string(config_file("hosts"))
     {
         hosts =
             text.lines().flat_map(|l| l.split('#').next().unwrap_or("").split_whitespace()).map(String::from).collect();
@@ -142,10 +143,10 @@ fn run_once(workers: &[Arc<Worker>], renderer: &mut Renderer, st: &Settings, rx:
             let (w, h) = term::size();
             let dt = now.duration_since(last).as_secs_f64().min(1.5 / FPS);
             last = now;
-            let fr = renderer.frame(&snaps(workers), st, w, Some(h.saturating_sub(1)), now, Some(dt), false, false);
+            let mut fr = renderer.frame(&snaps(workers), st, w, Some(h.saturating_sub(1)), now, Some(dt), false, false);
             let mut out = if shown > 1 { format!("\r\x1b[{}A\x1b[J", shown - 1) } else { "\r\x1b[J".into() };
             let lines: Vec<String> = std::iter::once(fr.header.clone())
-                .chain(fr.rows(w))
+                .chain(fr.take_rows(w))
                 .take(h.saturating_sub(1).max(1))
                 .map(|l| term::encode(&l.cells, cs))
                 .collect();
@@ -165,9 +166,9 @@ fn run_once(workers: &[Arc<Worker>], renderer: &mut Renderer, st: &Settings, rx:
     }
     let w = if tty { term::size().0 } else { std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80) };
     let hosts = snaps(workers);
-    let fr = renderer.frame(&hosts, st, w, None, Instant::now(), None, false, false);
+    let mut fr = renderer.frame(&hosts, st, w, None, Instant::now(), None, false, false);
     let mut out: Vec<String> =
-        std::iter::once(fr.header.clone()).chain(fr.rows(w)).map(|l| term::encode(&l.cells, cs)).collect();
+        std::iter::once(fr.header.clone()).chain(fr.take_rows(w)).map(|l| term::encode(&l.cells, cs)).collect();
     out.push(String::new());
     term::write_out(&out.join("\n"));
     if hosts.iter().any(|h| h.sample.is_some()) { 0 } else { 1 }
@@ -177,24 +178,25 @@ fn run() -> i32 {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("gpustatus: {e}\n\n{}", usage());
+            eprintln!("rgtop: {e}\n\n{}", usage());
             return 2;
         }
     };
     let hosts = load_hosts(args.hosts);
     if hosts.is_empty() {
         eprintln!(
-            "gpustatus: no hosts. Pass ssh host aliases as arguments, set $GPUSTATUS_HOSTS, \
+            "rgtop: no hosts. Pass ssh host aliases as arguments, set $RGTOP_HOSTS, \
                    or list them in {}",
             config_dir().join("hosts").display()
         );
         return 2;
     }
     let path = config_dir().join("settings.json");
-    let mut st = if args.reset { Settings::default() } else { load_settings(&path) };
-    if !path.exists()
+    let saved = config_file("settings.json");
+    let mut st = if args.reset { Settings::default() } else { load_settings(&saved) };
+    if !saved.exists()
         && args.theme.is_none()
-        && let Some(t) = choice(&std::env::var("GPUSTATUS_THEME").unwrap_or_default(), &THEMES)
+        && let Some(t) = choice(&env("THEME").unwrap_or_default(), &THEMES)
     {
         st.theme = t;
     }
@@ -202,7 +204,7 @@ fn run() -> i32 {
         st.theme = t;
     }
     if let Some(iv) = args.interval {
-        st.interval_ms = (iv.clamp(0.25, 600.0) * 1000.0) as u64;
+        st.interval_ms = (iv.clamp(0.1, 600.0) * 1000.0).round() as u64;
     }
 
     let tty = std::io::stdout().is_terminal();
@@ -216,12 +218,10 @@ fn run() -> i32 {
 
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let want_procs = Arc::new(AtomicBool::new(st.show_proc || st.show_user));
+    let want = Arc::new(AtomicU8::new(want_level(&st)));
     let workers: Vec<Arc<Worker>> = hosts
         .iter()
-        .map(|h| {
-            Arc::new(Worker::new(h, ssh_command(h, args.timeout), !live, tx.clone(), stop.clone(), want_procs.clone()))
-        })
+        .map(|h| Arc::new(Worker::new(h, ssh_command(h, args.timeout), !live, tx.clone(), stop.clone(), want.clone())))
         .collect();
     let hard = args.timeout as f64 + 7.0;
 
@@ -260,7 +260,7 @@ fn run() -> i32 {
                 let _ = tx.send(Msg::InputEof);
             });
         }
-        let mut app = App::new(st, workers.clone(), renderer, rx, want_procs, auto, hard);
+        let mut app = App::new(st, workers.clone(), renderer, rx, want, auto, hard);
         app.run();
         save_settings(&path, &app.st);
         0

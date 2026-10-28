@@ -1,10 +1,11 @@
-//! Persistent UI settings (~/.config/gpustatus/settings.json), like btop.conf.
+//! Persistent UI settings (~/.config/rgtop/settings.json), like btop.conf.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub const INTERVALS_MS: [u64; 9] = [500, 1000, 1500, 2000, 3000, 5000, 10000, 30000, 60000];
+pub const INTERVAL_MIN_MS: u64 = 100;
+pub const INTERVAL_MAX_MS: u64 = 600_000;
 pub const SORTS: [&str; 4] = ["host", "idle", "vram", "util"];
 pub const VIEWS: [&str; 2] = ["cards", "list"];
 pub const THEMES: [&str; 3] = ["auto", "dark", "light"];
@@ -44,13 +45,24 @@ impl Default for Settings {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
+fn config_base() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
-    base.join("gpustatus")
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"))
+}
+
+pub fn config_dir() -> PathBuf {
+    config_base().join("rgtop")
+}
+
+/// A config file to read: ~/.config/rgtop/<name>, else the one from before the
+/// rename (~/.config/gpustatus/<name>). Writes always go to config_dir().
+pub fn config_file(name: &str) -> PathBuf {
+    let new = config_dir().join(name);
+    let old = config_base().join("gpustatus").join(name);
+    if !new.exists() && old.exists() { old } else { new }
 }
 
 /// Map a string onto one of the allowed choices (so we can keep `&'static str`).
@@ -77,7 +89,7 @@ pub fn load_settings(path: &Path) -> Settings {
     flag("show_proc", &mut st.show_proc);
     flag("mouse", &mut st.mouse);
     if let Some(v) = d.get("interval_ms").and_then(Value::as_u64) {
-        st.interval_ms = v.clamp(250, 600_000);
+        st.interval_ms = v.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS);
     }
     let pick = |k: &str, of: &[&'static str], cur: &mut &'static str| {
         if let Some(v) = d.get(k).and_then(Value::as_str).and_then(|v| choice(v, of)) {
@@ -108,12 +120,19 @@ pub fn save_settings(path: &Path, st: &Settings) {
     }
 }
 
-/// Next preset interval up (dir > 0) or down from `ms`.
+/// The interval 100 ms up (dir > 0) or down from `ms`, like btop's + / -.
 pub fn step_interval(ms: u64, dir: i32) -> u64 {
-    if dir > 0 {
-        INTERVALS_MS.into_iter().find(|&v| v > ms).unwrap_or(INTERVALS_MS[8])
-    } else {
-        INTERVALS_MS.into_iter().rev().find(|&v| v < ms).unwrap_or(INTERVALS_MS[0])
+    let ms = (ms + 50) / 100 * 100; // snap e.g. a 250 from -n 0.25 onto the grid
+    let next = if dir > 0 { ms + 100 } else { ms.saturating_sub(100) };
+    next.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS)
+}
+
+/// 100ms, 1.5s, 2s
+pub fn fmt_interval(ms: u64) -> String {
+    match ms {
+        ..1000 => format!("{ms}ms"),
+        _ if ms.is_multiple_of(1000) => format!("{}s", ms / 1000),
+        _ => format!("{:.1}s", ms as f64 / 1000.0),
     }
 }
 
@@ -123,7 +142,7 @@ mod tests {
 
     #[test]
     fn bad_fields_keep_defaults() {
-        let dir = std::env::temp_dir().join(format!("gpustatus-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rgtop-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("settings.json");
         std::fs::write(
@@ -133,13 +152,15 @@ mod tests {
         )
         .unwrap();
         let st = load_settings(&p);
-        assert_eq!((st.interval_ms, st.sort, st.reverse, st.view), (250, "host", false, "list"));
+        assert_eq!((st.interval_ms, st.sort, st.reverse, st.view), (100, "host", false, "list"));
         assert_eq!(st.collapsed, ["a"]);
         save_settings(&p, &st);
         assert_eq!(load_settings(&p).view, "list");
         std::fs::remove_dir_all(dir).unwrap();
-        assert_eq!(step_interval(2000, 1), 3000);
-        assert_eq!(step_interval(2000, -1), 1500);
-        assert_eq!(step_interval(60000, 1), 60000);
+        assert_eq!(step_interval(2000, 1), 2100);
+        assert_eq!(step_interval(200, -1), 100);
+        assert_eq!(step_interval(100, -1), 100);
+        assert_eq!(step_interval(250, 1), 400);
+        assert_eq!([fmt_interval(100), fmt_interval(1500), fmt_interval(2000)], ["100ms", "1.5s", "2s"]);
     }
 }

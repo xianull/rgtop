@@ -1,7 +1,7 @@
 name: release
 
 # Every push / PR: test on Linux and macOS.
-# A tag like v3.0.0: also build static binaries and publish a GitHub release
+# A tag like v4.0.0: also build static binaries and publish a GitHub release
 # (install.sh downloads from there).
 on:
   push:
@@ -30,11 +30,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --locked
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: tar -czf gpustatus-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release gpustatus
+      - run: tar -czf rgtop-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release rgtop
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: gpustatus-${{ matrix.target }}.tar.gz
+          path: rgtop-${{ matrix.target }}.tar.gz
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -44,9 +44,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: sha256sum gpustatus-*.tar.gz > SHA256SUMS
+      - run: sha256sum rgtop-*.tar.gz > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "$GITHUB_REF_NAME" gpustatus-*.tar.gz SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" rgtop-*.tar.gz SHA256SUMS
           --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

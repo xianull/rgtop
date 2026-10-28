@@ -1,28 +1,60 @@
 //! Terminal primitives: styled cells, colour encoding, cbreak mode, and an
 //! alternate-screen writer that re-sends only the cells that changed.
 
-use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
 pub type Rgb = [u8; 3];
 
+/// Foreground, background and bold packed into one integer: the screen diff
+/// compares every cell of every frame, and this makes each a single compare.
+/// Bits 0-23 fg RGB, 24 fg set, 25-48 bg RGB, 49 bg set, 50 bold.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct Style {
-    pub fg: Option<Rgb>,
-    pub bg: Option<Rgb>,
-    pub bold: bool,
-}
+pub struct Style(u64);
 
-pub const PLAIN: Style = Style { fg: None, bg: None, bold: false };
+pub const PLAIN: Style = Style(0);
 
 impl Style {
-    pub const fn fg(c: Rgb) -> Self {
-        Style { fg: Some(c), bg: None, bold: false }
+    const FG: u64 = 1 << 24;
+    const BG: u64 = 1 << 49;
+    const BOLD: u64 = 1 << 50;
+
+    const fn pack(c: Rgb) -> u64 {
+        (c[0] as u64) << 16 | (c[1] as u64) << 8 | c[2] as u64
     }
+
+    const fn unpack(v: u64) -> Rgb {
+        [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+    }
+
+    pub const fn fg(c: Rgb) -> Self {
+        Style(Self::pack(c) | Self::FG)
+    }
+
+    pub const fn bg(c: Rgb) -> Self {
+        Style(Self::pack(c) << 25 | Self::BG)
+    }
+
+    /// this style on background `c`
+    pub const fn on(self, c: Rgb) -> Self {
+        Style(self.0 & !(0x1FF_FFFF << 25) | Self::bg(c).0)
+    }
+
     pub const fn bold(self) -> Self {
-        Style { bold: true, ..self }
+        Style(self.0 | Self::BOLD)
+    }
+
+    fn fg_rgb(self) -> Option<Rgb> {
+        (self.0 & Self::FG != 0).then(|| Self::unpack(self.0))
+    }
+
+    fn bg_rgb(self) -> Option<Rgb> {
+        (self.0 & Self::BG != 0).then(|| Self::unpack(self.0 >> 25))
+    }
+
+    fn is_bold(self) -> bool {
+        self.0 & Self::BOLD != 0
     }
 }
 
@@ -77,12 +109,37 @@ fn ansi256([r, g, b]: Rgb) -> u8 {
     if d(gv, gv, gv) < d(LV[qr], LV[qg], LV[qb]) { 232 + gi as u8 } else { (16 + 36 * qr + 6 * qg + qb) as u8 }
 }
 
+/// Decimal digits without the fmt machinery: a frame can carry thousands of
+/// these (gradient meters change colour every cell).
+fn push_num(buf: &mut String, n: usize) {
+    if n >= 10 {
+        push_num(buf, n / 10);
+    }
+    buf.push((b'0' + (n % 10) as u8) as char);
+}
+
 fn color(buf: &mut String, c: Rgb, fg: bool, cs: Colors) {
-    let base = if fg { 38 } else { 48 };
-    let _ = match cs {
-        Colors::True => write!(buf, "{base};2;{};{};{}", c[0], c[1], c[2]),
-        _ => write!(buf, "{base};5;{}", ansi256(c)),
-    };
+    buf.push_str(if fg { "38;" } else { "48;" });
+    if cs == Colors::True {
+        buf.push_str("2;");
+        for (k, v) in c.into_iter().enumerate() {
+            if k > 0 {
+                buf.push(';');
+            }
+            push_num(buf, v as usize);
+        }
+    } else {
+        buf.push_str("5;");
+        push_num(buf, ansi256(c) as usize);
+    }
+}
+
+fn move_to(buf: &mut String, y: usize, x: usize) {
+    buf.push_str("\x1b[");
+    push_num(buf, y + 1);
+    buf.push(';');
+    push_num(buf, x + 1);
+    buf.push('H');
 }
 
 /// Emit only the attribute *changes* from `cur` to `want`; per-cell gradient
@@ -98,23 +155,27 @@ fn sgr(buf: &mut String, cur: &mut Style, want: Style, cs: Colors) {
             buf.push(';');
         }
     };
-    if (cur.bold && !want.bold) || (cur.fg.is_some() && want.fg.is_none()) || (cur.bg.is_some() && want.bg.is_none()) {
+    let (fg, bg) = (want.fg_rgb(), want.bg_rgb());
+    if (cur.is_bold() && !want.is_bold())
+        || (cur.fg_rgb().is_some() && fg.is_none())
+        || (cur.bg_rgb().is_some() && bg.is_none())
+    {
         buf.push('0');
         *cur = PLAIN;
     }
-    if want.fg != cur.fg
-        && let Some(c) = want.fg
+    if fg != cur.fg_rgb()
+        && let Some(c) = fg
     {
         sep(buf);
         color(buf, c, true, cs);
     }
-    if want.bg != cur.bg
-        && let Some(c) = want.bg
+    if bg != cur.bg_rgb()
+        && let Some(c) = bg
     {
         sep(buf);
         color(buf, c, false, cs);
     }
-    if want.bold && !cur.bold {
+    if want.is_bold() && !cur.is_bold() {
         sep(buf);
         buf.push('1');
     }
@@ -233,9 +294,16 @@ impl Screen {
         self.size = None;
     }
 
-    /// Diff against the previous frame per cell: only the changed span of each
-    /// row is sent, so an easing bar costs a few cells, not a row.
     pub fn draw(&mut self, rows: Vec<Vec<Cell>>, w: usize, h: usize) {
+        let out = self.diff(rows, w, h);
+        if !out.is_empty() {
+            write_out(&out);
+        }
+    }
+
+    /// Diff against the previous frame per cell: only the changed span of each
+    /// row is sent, so an easing bar costs a few cells, not a row. "" = nothing changed.
+    pub fn diff(&mut self, rows: Vec<Vec<Cell>>, w: usize, h: usize) -> String {
         let mut buf = String::with_capacity(4096);
         let mut cur = PLAIN;
         if self.size != Some((w, h)) {
@@ -254,7 +322,7 @@ impl Screen {
                 },
                 None => (0, row.len()),
             };
-            let _ = write!(buf, "\x1b[{};{}H", y + 1, a + 1);
+            move_to(&mut buf, y, a);
             for c in &row[a..b] {
                 if c.ch != WIDE_TAIL {
                     sgr(&mut buf, &mut cur, c.st, self.cs);
@@ -269,14 +337,16 @@ impl Screen {
         if self.prev.len() > rows.len() {
             buf.push_str("\x1b[0m");
             for y in rows.len()..self.prev.len() {
-                let _ = write!(buf, "\x1b[{};1H\x1b[2K", y + 1);
+                move_to(&mut buf, y, 0);
+                buf.push_str("\x1b[2K");
             }
         }
         self.prev = rows;
-        if !buf.is_empty() {
-            // synchronized update (DEC 2026): the terminal shows the frame atomically
-            write_out(&format!("\x1b[?2026h\x1b[0m{buf}\x1b[0m\x1b[?2026l"));
+        if buf.is_empty() {
+            return buf;
         }
+        // synchronized update (DEC 2026): the terminal shows the frame atomically
+        format!("\x1b[?2026h\x1b[0m{buf}\x1b[0m\x1b[?2026l")
     }
 }
 
@@ -302,6 +372,15 @@ mod tests {
         assert_eq!(diff_span(&row("abcdef"), &row("abXdeY")), Some((2, 6)));
         assert_eq!(diff_span(&row("abc"), &row("abc")), None);
         assert_eq!(diff_span(&row("a中\0b"), &row("a国\0b")), Some((1, 2)));
+    }
+
+    #[test]
+    fn style_packs_and_encodes() {
+        let st = Style::fg([1, 2, 3]).on([250, 251, 252]).bold();
+        assert_eq!((st.fg_rgb(), st.bg_rgb(), st.is_bold()), (Some([1, 2, 3]), Some([250, 251, 252]), true));
+        assert_eq!(Style::fg([9, 9, 9]).on([1, 1, 1]).on([2, 2, 2]).bg_rgb(), Some([2, 2, 2]));
+        let row = [Cell { ch: 'x', st }];
+        assert_eq!(encode(&row, Colors::True), "\x1b[38;2;1;2;3;48;2;250;251;252;1mx\x1b[0m");
     }
 
     #[test]

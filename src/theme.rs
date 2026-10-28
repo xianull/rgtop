@@ -85,6 +85,7 @@ pub struct Theme {
     pub state: [Style; 3],
     title_rgb: Rgb,
     faint: Rgb,
+    cache: Rgb, // page-cache part of the RAM meter
     ramp: Vec<Rgb>,
     heat: Vec<Rgb>,
 }
@@ -107,13 +108,14 @@ impl Theme {
             off: Style::fg(p.off),
             me: Style::fg(p.accent).bold(),
             baseline: Style::fg(p.faint),
-            track: Style { fg: None, bg: Some(p.faint), bold: false },
+            track: Style::bg(p.faint),
             warn: Style::fg(p.yellow),
             warn_on: Style::fg(p.yellow).bold(),
             err: Style::fg(p.red).bold(),
             state: [p.green, p.yellow, p.red].map(|c| Style::fg(c).bold()),
             title_rgb: p.title,
             faint: p.faint,
+            cache: mix(p.faint, p.dim, 0.45),
             ramp: gradient(&[p.green, p.yellow, p.red]),
             heat: gradient(&[p.aqua, p.yellow, p.red]),
         }
@@ -126,7 +128,18 @@ impl Theme {
 
     /// One cell of a meter: ramp colour by position, on the tinted track.
     pub fn bar(&self, pct: usize) -> Style {
-        Style { fg: Some(self.ramp[pct.min(100)]), bg: Some(self.faint), bold: false }
+        self.bar_on(pct, false)
+    }
+
+    /// Like `bar`, but over the cache colour instead of the empty track.
+    pub fn bar_on(&self, pct: usize, cache: bool) -> Style {
+        let bg = if cache { self.cache } else { self.faint };
+        Style::fg(self.ramp[pct.min(100)]).on(bg)
+    }
+
+    /// A cache cell of the RAM meter.
+    pub fn cache_cell(&self) -> Style {
+        Style::fg(self.cache).on(self.faint)
     }
 
     pub fn temp(&self, c: f64) -> Style {
