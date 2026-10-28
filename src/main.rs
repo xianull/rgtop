@@ -63,8 +63,8 @@ fn parse_args() -> Result<Args, String> {
         // --opt=value, -nVALUE, or -n VALUE
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
-            _ if !arg.starts_with("--") && arg.len() > 2 && matches!(&arg[..2], "-n" | "-t") => {
-                (arg[..2].to_string(), Some(arg[2..].to_string()))
+            _ if !arg.starts_with("--") && arg.len() > 2 && matches!(arg.get(..2), Some("-n" | "-t")) => {
+                (arg[..2].to_string(), Some(arg[2..].strip_prefix('=').unwrap_or(&arg[2..]).to_string()))
             }
             _ => (arg.clone(), None),
         };
@@ -75,7 +75,7 @@ fn parse_args() -> Result<Args, String> {
             "-1" | "--once" => a.once = true,
             "-n" | "--interval" => {
                 let v = value(&flag)?;
-                a.interval = Some(v.parse().map_err(|_| format!("bad interval: {v}"))?);
+                a.interval = Some(v.parse().ok().filter(|x: &f64| x.is_finite()).ok_or(format!("bad interval: {v}"))?);
             }
             "-t" | "--timeout" => {
                 let v = value(&flag)?;
@@ -225,8 +225,9 @@ fn run() -> i32 {
         .collect();
     let hard = args.timeout as f64 + 7.0;
 
-    use libc::{SIGHUP, SIGINT, SIGTERM, SIGTSTP, SIGWINCH};
-    let sigs: &[i32] = if live { &[SIGWINCH, SIGTSTP, SIGINT, SIGTERM, SIGHUP] } else { &[SIGINT, SIGTERM, SIGHUP] };
+    use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGWINCH};
+    let sigs: &[i32] =
+        if live { &[SIGWINCH, SIGTSTP, SIGINT, SIGQUIT, SIGTERM, SIGHUP] } else { &[SIGINT, SIGQUIT, SIGTERM, SIGHUP] };
     if let Ok(mut signals) = signal_hook::iterator::Signals::new(sigs) {
         let tx = tx.clone();
         std::thread::spawn(move || {

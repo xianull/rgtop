@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::Msg;
 
+static SPAWN: Mutex<()> = Mutex::new(());
+
 pub const HISTORY: usize = 240; // util samples kept per GPU for the sparkline
 const IDLE_PCT: f64 = 5.0; // util AND mem below this -> idle  (green)
 const LIGHT_PCT: f64 = 40.0; // util AND mem below this -> light (yellow), otherwise busy (red)
@@ -472,18 +474,25 @@ impl Worker {
             self.host.lock().unwrap().connecting();
             self.notify();
             *self.kill_reason.lock().unwrap() = None;
+            // macOS has no pipe2(): pipes are made close-on-exec in a second step,
+            // so a concurrent spawn could inherit another host's pipe and hold it
+            // open (that host would never see EOF). Serialize pipe creation + spawn.
+            let guard = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
             let child = std::io::pipe().and_then(|(reader, writer)| {
-                // ssh gets its own process group: Ctrl-C in our terminal doesn't
-                // reach it, and killpg also takes down a ProxyCommand child
-                let child = Command::new(&self.cmd[0])
-                    .args(&self.cmd[1..])
-                    .stdin(Stdio::piped())
-                    .stdout(writer.try_clone()?)
-                    .stderr(writer)
-                    .process_group(0)
-                    .spawn()?;
-                Ok((child, reader)) // the Command and its pipe ends are dropped here
+                let mut cmd = Command::new(&self.cmd[0]);
+                cmd.args(&self.cmd[1..]).stdin(Stdio::piped()).stdout(writer.try_clone()?).stderr(writer);
+                // ssh gets its own session: no controlling tty (a prompt can't draw
+                // over the UI), Ctrl-C doesn't reach it, and killpg also takes down
+                // a ProxyCommand child. setsid() is async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+                Ok((cmd.spawn()?, reader)) // the Command and its pipe ends are dropped here
             });
+            drop(guard);
             let (mut child, reader) = match child {
                 Ok(c) => c,
                 Err(e) => {

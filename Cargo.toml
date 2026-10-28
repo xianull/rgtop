@@ -1,6 +1,6 @@
 [package]
 name = "gpustatus"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 description = "btop-style live GPU/CPU dashboard for remote NVIDIA servers over SSH"
 license = "MIT"
@@ -18,3 +18,4 @@ unicode-width = "0.2"
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort" # the panic hook restores the terminal first; a dead worker must not leave a half-alive UI

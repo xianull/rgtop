@@ -153,7 +153,7 @@ fn query_background(timeout: Duration) -> Option<[f64; 3]> {
             return None;
         }
         let mut raw = old;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG); // Ctrl-C here would skip the restore
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(0, libc::TCSANOW, &raw);
