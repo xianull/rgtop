@@ -2,23 +2,13 @@
 
 [English](README.md) | **简体中文**
 
-btop 风格的多机 GPU / CPU / 内存实时看板。在本地运行，通过 SSH 连接各台服务器，键盘和鼠标都能操作。本地只有一个约 700 KB 的静态二进制，服务器上什么都不用装。
+**rgtop**（**r**emote **G**PU **top**，远程 GPU 版 top）是 btop 风格的多机 GPU / CPU / 内存实时看板。在本地运行，通过 SSH 连接各台服务器，键盘和鼠标都能操作。本地只有一个约 700 KB 的静态二进制，服务器上什么都不用装。
 
-```
- ◆ rgtop   11/40 GPUs idle  ·  2,282 GiB VRAM free  ·  5/5 hosts  ·  you on 4 GPUs   ● idle  ● light  ● busy    20:57:39
-╭─ ▾ ● gpu-h100-1  8× H100 80GB HBM3 · 2× XEON PLATINUM 8558 ─────────────────────────────────── 4/8 idle · 499G free ─╮
-│ CPU ███▊                      16%  RAM ██▊▒▒▒▒▒▒▒            275/2016G  swap 0.2G       ⣀⣠⣤⣴⣶⣦⣤⣀⣀⣠⣤⣴   45°       │
-│ 192c ▁▂█▁▁▁█▁█▁▁▁▁▁▁▁▁▁▂█▁▁▁▁█▂▁█▁▁▃█▁▁▁███▁▃▁▁██▁▁█▁█▃▁▁▃█▃█▄▁▃▁▁█▁▁                            load 40.9 33.1 30.7 │
-│   # UTIL                           VRAM                                  USER         HISTORY         TEMP POWER │
-│ ● 0 ████████████████████████ 100%  █████████████████████▊     72.1/80G  alice                   ⣿⣿⣿⣿⣿⣿⣿   53°  558W │
-│ ● 1                            0%                              0.0/80G  -                       ⣀⣀⣀⣀⣀⣀⣀   35°  102W │
-│ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
-│     PID  USER    GPU   VRAM   %CPU     RSS    TIME  COMMAND                                                          │
-│ 3422397  alice   0    72.1G    101    3.2G  16m47s  python train.py --config big.yaml                                │
-│ cpu users  bob 3617% 233.8G · alice 101% 3.2G · root 9% 7.9G                                                        │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────── up 50d · ↻ 49ms ─╯
- ← host →  reverse  free  cpu  hist  user  proc  list  ␣ pause                     − 100ms +  theme auto  ? help  quit
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
+  <img alt="rgtop：4 台 GPU 服务器，两台展开显示 CPU、GPU 和进程，两台折叠" src="docs/screenshot-dark.png">
+</picture>
 
 - **GPU 行**：利用率、显存、谁在用这张卡（`+N` 表示还有 N 个用户，你自己会高亮）、利用率历史、温度、功耗。圆点绿色是空闲（利用率和显存都 < 5%），黄色是轻度占用（都 < 40%），红色是繁忙；状态变化时颜色会渐变过去。
 - **CPU 行**：和 GPU 列对齐，依次是 CPU 总占用、内存（已用部分用渐变色，page cache 用暗色接在后面）、1 分钟负载、CPU 历史曲线、CPU 封装温度。下面一行（按 `o` 开关）是每核热力条（核比格子多时，每格显示组里最忙的那个核），右边是 1 / 5 / 15 分钟负载和 swap。
@@ -113,10 +103,18 @@ rgtop --reset      # 忽略保存的设置
 
 底栏和 btop 一样，每个按钮都能用鼠标点。刷新间隔、排序、各个开关、视图、配色、折叠了哪些机器，退出时保存到 `~/.config/rgtop/settings.json`。
 
+### 配色
+
+`auto` 会按终端背景自动选暗色或亮色；按 `t` 在 auto → dark → light 之间切换。
+
+| 暗色 | 亮色 |
+| --- | --- |
+| <img alt="rgtop 暗色配色" src="docs/screenshot-dark.png"> | <img alt="rgtop 亮色配色" src="docs/screenshot-light.png"> |
+
 ## 实现要点
 
 - **每台机器一条 SSH 长连接，按需采样**：远端运行一个小 agent，本地每发一行请求，远端回一帧数据。所以改刷新间隔立即生效，暂停时完全不采样，任何一次采样都不用重新握手。断线后按 2s、4s、8s… 退避重连，最长 30 秒。
-- **采样时远端零 fork**：agent（`src/agent.py`，只用 Python 3 标准库）在进程内通过 NVML 读 GPU、读 `/proc` 拿主机数据，一次采样约 1ms，而启动一次 `nvidia-smi` 要约 250ms。GPU 进程列表每秒刷新一次，每核热力条每 0.5 秒一次，全机 CPU 用户统计在后台线程里每 5 秒一次。服务器没有 python3 时，改用运行 `nvidia-smi` 的 shell 版 agent。
+- **采样时远端零 fork**：agent（`src/agent.py`，只用 Python 3 标准库）在进程内通过 NVML 读 GPU、读 `/proc` 拿主机数据，一次采样约 1ms，而启动一次 `nvidia-smi` 要约 250ms。GPU 进程列表每秒刷新一次，每核热力条最快每 0.2 秒一次，全机 CPU 用户统计在后台线程里每 5 秒一次。服务器没有 python3 时，改用运行 `nvidia-smi` 的 shell 版 agent。
 - **渲染**：每帧整体重建，再和上一帧逐格比较，每行只发送变化的那一段，并用同步输出（DEC 2026）避免撕裂。新数据到来后，条形图、数字、状态圆点以最多 30fps 缓动约 0.3 秒，之后画面静止：每一帧都要终端和系统窗口服务器重绘，帧数越少电脑越不卡。
 - **实测**（5 台服务器 × 8 卡）：2 秒间隔时，rgtop 本地占单核 0.4%、终端每秒重绘约 6 次，远端 agent 占单核 0.8%；100ms 间隔时，本地 1.9%（每秒重绘 28 次），远端 2.6%（服务器共 192 核）。内存 4 MiB。
 - **不留残余进程**：rgtop 至少每 15 秒给每个 agent 发一次心跳（暂停时也发），agent 60 秒收不到任何东西就自动退出。即使断开时的关闭包没送到服务器（代理、VPN、电脑休眠），也不会在服务器上留下进程。
@@ -128,7 +126,8 @@ rgtop --reset      # 忽略保存的设置
 cargo run -- host1 host2                                    # 调试运行
 cargo test                                                  # 单元测试
 cargo test --release -- --ignored bench_frame --nocapture   # 单帧耗时基准测试
-git tag v4.0.1 && git push --tags                           # CI 编译 4 个平台并发布 Release
+uv run --with pyte --with pillow --with fonttools docs/screenshots.py   # 重新生成 README 截图（虚构的主机和用户）
+git tag v4.1.1 && git push --tags                           # CI 编译 4 个平台并发布 Release
 ```
 
 ## License

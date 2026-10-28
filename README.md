@@ -2,23 +2,13 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A btop-style live dashboard for NVIDIA GPUs, CPUs and memory on many remote servers, over plain SSH. One ~700 KB static binary on your machine; nothing to install on the servers.
+**rgtop** (**r**emote **G**PU **top**) is a btop-style live dashboard for NVIDIA GPUs, CPUs and memory on many remote servers, over plain SSH. One ~700 KB static binary on your machine; nothing to install on the servers.
 
-```
- ◆ rgtop   11/40 GPUs idle  ·  2,282 GiB VRAM free  ·  5/5 hosts  ·  you on 4 GPUs   ● idle  ● light  ● busy    20:57:39
-╭─ ▾ ● gpu-h100-1  8× H100 80GB HBM3 · 2× XEON PLATINUM 8558 ─────────────────────────────────── 4/8 idle · 499G free ─╮
-│ CPU ███▊                      16%  RAM ██▊▒▒▒▒▒▒▒            275/2016G  swap 0.2G       ⣀⣠⣤⣴⣶⣦⣤⣀⣀⣠⣤⣴   45°       │
-│ 192c ▁▂█▁▁▁█▁█▁▁▁▁▁▁▁▁▁▂█▁▁▁▁█▂▁█▁▁▃█▁▁▁███▁▃▁▁██▁▁█▁█▃▁▁▃█▃█▄▁▃▁▁█▁▁                            load 40.9 33.1 30.7 │
-│   # UTIL                           VRAM                                  USER         HISTORY         TEMP POWER │
-│ ● 0 ████████████████████████ 100%  █████████████████████▊     72.1/80G  alice                   ⣿⣿⣿⣿⣿⣿⣿   53°  558W │
-│ ● 1                            0%                              0.0/80G  -                       ⣀⣀⣀⣀⣀⣀⣀   35°  102W │
-│ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
-│     PID  USER    GPU   VRAM   %CPU     RSS    TIME  COMMAND                                                          │
-│ 3422397  alice   0    72.1G    101    3.2G  16m47s  python train.py --config big.yaml                                │
-│ cpu users  bob 3617% 233.8G · alice 101% 3.2G · root 9% 7.9G                                                        │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────── up 50d · ↻ 49ms ─╯
- ← host →  reverse  free  cpu  hist  user  proc  list  ␣ pause                     − 100ms +  theme auto  ? help  quit
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
+  <img alt="rgtop: four GPU servers, two expanded with CPU rows, GPU rows and processes, two folded" src="docs/screenshot-dark.png">
+</picture>
 
 - **GPU rows**: utilization, VRAM, who uses the card (`+N` = N more users, yours highlighted), utilization history, temperature, power. The dot is green when idle (util and VRAM < 5%), yellow when lightly used (< 40%), red when busy, and fades between them.
 - **CPU rows**: total CPU, RAM (used, then page cache in a muted tone), 1-minute load, CPU history and package temperature on the GPU columns; below them (toggle with `o`) one cell per core (busiest core per cell when there are more cores than room), the 1 / 5 / 15 min load and swap.
@@ -113,10 +103,18 @@ rgtop --reset      # ignore saved settings
 
 Every button in the bottom bar is clickable, like btop. Interval, sort, toggles, view, theme and folded hosts are saved to `~/.config/rgtop/settings.json` on exit.
 
+### Themes
+
+`auto` picks dark or light from your terminal's background; `t` cycles auto → dark → light.
+
+| Dark | Light |
+| --- | --- |
+| <img alt="rgtop, dark theme" src="docs/screenshot-dark.png"> | <img alt="rgtop, light theme" src="docs/screenshot-light.png"> |
+
 ## How it works
 
 - **One SSH session per host, on demand.** The session runs a small agent that answers one request line with one frame, so the local side decides when to sample: interval changes apply instantly, pausing costs nothing, and no sample pays for a handshake. Lost connections retry after 2 s, 4 s, 8 s … up to 30 s.
-- **No forks per sample.** The agent (`src/agent.py`, Python 3 stdlib) reads GPUs through NVML and the host from `/proc` in-process: ~1 ms per sample, versus ~250 ms to start `nvidia-smi`. GPU process lists are refreshed once a second, the per-core strip twice a second, the host's top CPU users every 5 s in a background thread. On a host without python3, a shell agent running `nvidia-smi` takes over.
+- **No forks per sample.** The agent (`src/agent.py`, Python 3 stdlib) reads GPUs through NVML and the host from `/proc` in-process: ~1 ms per sample, versus ~250 ms to start `nvidia-smi`. GPU process lists are refreshed once a second, the per-core strip up to five times a second, the host's top CPU users every 5 s in a background thread. On a host without python3, a shell agent running `nvidia-smi` takes over.
 - **Rendering.** Frames are rebuilt from scratch and diffed cell by cell against the previous one; only the changed span of each row is sent, inside a synchronized update (no tearing). Bars, numbers and status dots ease at up to 30 fps for ~0.3 s after new data, then the screen is left alone: every frame is work for your terminal and the window server too.
 - **Measured** with 5 servers × 8 GPUs: at a 2 s interval rgtop uses 0.4% of one local core and ~6 terminal redraws/s, the agent 0.8% of one server core; at 100 ms, 1.9% locally (28 redraws/s) and 2.6% on the server (of 192 cores). Memory: 4 MiB.
 - **No leftovers.** rgtop pings every agent at least every 15 s, paused or not, and an agent that hears nothing for 60 s exits: a connection whose close never reached the server (proxies, VPNs, a sleeping laptop) can't leave it running.
@@ -128,7 +126,8 @@ Every button in the bottom bar is clickable, like btop. Interval, sort, toggles,
 cargo run -- host1 host2                               # run
 cargo test                                             # tests
 cargo test --release -- --ignored bench_frame --nocapture   # frame-time benchmark
-git tag v4.0.1 && git push --tags                      # CI builds 4 platforms and publishes a release
+uv run --with pyte --with pillow --with fonttools docs/screenshots.py   # README screenshots (made-up hosts)
+git tag v4.1.1 && git push --tags                      # CI builds 4 platforms and publishes a release
 ```
 
 ## License

@@ -1,4 +1,4 @@
-# Append to ~/.ssh/config. gpustatus connects by Host alias, so each server
+# Append to ~/.ssh/config. rgtop connects by Host alias, so each server
 # needs key-based login first:  ssh-copy-id <alias>
 
 Host gpu-a100-1
