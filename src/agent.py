@@ -14,9 +14,9 @@ LEVELS = "0123456789abcdefghijklmnopqrstuvwxyz"  # per-core busy, 0..35
 
 def rd(path):
     try:
-        with open(path) as f:
-            return f.read()
-    except (OSError, UnicodeDecodeError):
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace")  # any locale, any bytes in argv
+    except OSError:
         return ""
 
 
@@ -24,7 +24,10 @@ def mib(b):
     return "%d" % ((b + 524288) // 1048576)  # rounded, like nvidia-smi
 
 
-me = pwd.getpwuid(os.getuid()).pw_name
+try:
+    me = pwd.getpwuid(os.getuid()).pw_name
+except KeyError:  # uid without a passwd entry (containers, flaky SSSD)
+    me = str(os.getuid())
 names = {}
 
 
@@ -172,10 +175,11 @@ def meminfo():
 
 
 prev_tot, prev_cores = cpu_stat(True)
-core_t, core_levels = time.time(), "0" * len(prev_cores)  # per-core strip: refreshed every 0.5 s
+t_start = time.monotonic()
+core_t, core_levels = t_start - 1.0, "0" * len(prev_cores)  # the first frame computes the strip too  # per-core strip: refreshed every 0.5 s
 proc_t, proc_lines = 0.0, []  # GPU processes: refreshed every 1 s (NVML: ~0.4 ms per GPU)
 prev_pid = {}  # GPU process pid -> (cpu ticks, wall time)
-host_lines, host_wanted, host_thread = [], 0.0, None
+host_lines, host_wanted, host_gap, host_thread = [], 0.0, 0.0, None
 
 
 def scan_host_users():
@@ -184,8 +188,8 @@ def scan_host_users():
     5 s and frames never wait for it; it stops when no longer asked for."""
     global host_lines
     prev, t0, nap = None, 0.0, 1.0
-    while time.time() - host_wanted < 15:
-        now, cur = time.time(), {}
+    while time.monotonic() - host_wanted < max(15.0, 3 * host_gap):  # outlives slow refresh intervals
+        now, cur = time.monotonic(), {}
         for d in os.listdir("/proc"):
             st = pid_stat(int(d)) if d.isdigit() else None
             if st is None:
@@ -237,8 +241,11 @@ def gpu_proc_lines(now, uptime):
 
 
 def frame(req):
-    global prev_tot, prev_cores, core_t, core_levels, proc_t, proc_lines, host_wanted, host_thread
-    now = time.time()
+    global prev_tot, prev_cores, core_t, core_levels, proc_t, proc_lines, host_wanted, host_gap, host_thread
+    now = time.monotonic()
+    if now - t_start < 0.3:  # first frame: give CPU % a window long enough to mean something
+        time.sleep(0.3 - (now - t_start))
+        now = time.monotonic()
     out = ["@@B\n", "@@S %s\n" % prev_tot]
     w = out.append
     if nv is not None:
@@ -251,7 +258,8 @@ def frame(req):
         lv = []
         for (t, i), (pt, pi) in zip(cores, prev_cores):
             dt = t - pt
-            lv.append(LEVELS[int(round(35.0 * (dt - (i - pi)) / dt))] if dt > 0 else "0")
+            busy = int(round(35.0 * (dt - (i - pi)) / dt)) if dt > 0 else 0
+            lv.append(LEVELS[min(35, max(0, busy))])  # idle counters can step backwards
         prev_cores, core_t, core_levels = cores, now, "".join(lv)
     prev_tot = tot
     total, avail, cache, swap_t, swap_f = meminfo()
@@ -269,7 +277,7 @@ def frame(req):
             proc_lines, proc_t = gpu_proc_lines(now, float(up[0]) if up else 0.0), now
         out.extend(proc_lines)
         if req == "h":
-            host_wanted = now
+            host_wanted, host_gap = now, now - host_wanted
             if host_thread is None or not host_thread.is_alive():
                 host_thread = threading.Thread(target=scan_host_users, daemon=True)
                 host_thread.start()
@@ -278,8 +286,13 @@ def frame(req):
     return "".join(out)
 
 
-if nv is None and nv_err and "cannot open shared object" not in nv_err:
-    sys.stderr.write("rgtop agent: %s\n" % nv_err)
+if nv is None and len(sys.argv) > 1:
+    # No usable NVML (no driver, library off the loader path, driver/library
+    # mismatch ...): hand over to the nvidia-smi agent (argv[1]), which also
+    # reports whatever nvidia-smi says is wrong. Nothing has been written yet.
+    sys.stdout.flush()
+    os.execvp("sh", ["sh", "-c", sys.argv[1]])
+out = sys.stdout.buffer
 while True:
     req = sys.stdin.readline()
     if not req:
@@ -288,5 +301,5 @@ while True:
         data = frame(req.strip())
     except Exception as e:  # never die mid-session: report it inside a frame
         data = "@@B\nagent error: %s: %s\n@@G 1\n@@E\n" % (type(e).__name__, e)
-    sys.stdout.write(data)
-    sys.stdout.flush()
+    out.write(data.encode("utf-8", "replace"))  # lone surrogates (odd user names) -> "?"
+    out.flush()

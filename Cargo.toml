@@ -2,6 +2,7 @@
 name = "rgtop"
 version = "4.0.0"
 edition = "2024"
+rust-version = "1.90" # let-chains, is_multiple_of, std::io::pipe
 description = "btop-style live GPU/CPU dashboard for remote NVIDIA servers over SSH"
 license = "MIT"
 repository = "https://github.com/xianull/rgtop"

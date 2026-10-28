@@ -46,9 +46,11 @@ fn sh_quote(s: &str) -> String {
 }
 
 pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
-    // python3 -I -S: no user site / PYTHONPATH / sitecustomize; just the stdlib
-    let launcher = format!("command -v python3 >/dev/null 2>&1 && exec python3 -I -S -c \"$1\"\n{AGENT_SH}");
-    let remote = format!("sh -c {} rgtop {}", sh_quote(&launcher), sh_quote(AGENT_PY));
+    // agent.py if this python3 can run it (-I -S: no user site, PYTHONPATH or
+    // sitecustomize, just the stdlib); it execs agent.sh itself if NVML is unusable
+    const LAUNCHER: &str = "python3 -I -S -c 'import ctypes, pwd' >/dev/null 2>&1 && \
+                            exec python3 -I -S -c \"$1\" \"$2\"\nexec sh -c \"$2\"\n";
+    let remote = format!("sh -c {} rgtop {} {}", sh_quote(LAUNCHER), sh_quote(AGENT_PY), sh_quote(AGENT_SH));
     let mut v: Vec<String> = ["ssh", "-T", "-x", "-a"].map(String::from).to_vec();
     for o in [
         "BatchMode=yes".to_string(),

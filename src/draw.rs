@@ -348,7 +348,11 @@ fn fmt_gib(kb: u64) -> String {
 
 /// process RSS
 fn fmt_kb(kb: u64) -> String {
-    if kb >= 1048576 { format!("{}G", D1(kb as f64 / 1048576.0)) } else { format!("{}M", kb / 1024) }
+    match kb {
+        1_048_576_000.. => format!("{}T", D1(kb as f64 / 1_073_741_824.0)),
+        1_048_576.. => format!("{}G", D1(kb as f64 / 1_048_576.0)),
+        _ => format!("{}M", kb / 1024),
+    }
 }
 
 /// %CPU, where 100 = one core
@@ -576,7 +580,7 @@ fn sys_rows(
     ln.add(&rjust(&txt, MEM_W), PLAIN);
     let swap_used = s.swap_total_kb.saturating_sub(s.swap_free_kb);
     let swap = (s.swap_total_kb > 0).then(|| {
-        let st = if swap_used * 4 > s.swap_total_kb { th.warn } else { th.dim }; // a quarter used: worth a look
+        let st = if swap_used > s.swap_total_kb / 4 { th.warn } else { th.dim }; // a quarter used: worth a look
         (format!("swap {}", fmt_gib(swap_used)), st)
     });
     if c.user > 0 {
