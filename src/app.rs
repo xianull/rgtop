@@ -1,18 +1,27 @@
 //! Interactive full-screen UI: keyboard + mouse input, sampling scheduler,
 //! frame pacing, scrolling.
 
+use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::collect::{DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, supervise};
+use crate::collect::{
+    DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, login_command, mux_socket, supervise,
+};
 use crate::draw::{FPS, Line, Renderer, footer_line};
 use crate::settings::{AUTO, AUTO_TICK_MS, SORTS, Settings, THEMES, VIEWS, step_interval};
 use crate::term::{self, Screen};
 use crate::theme::Theme;
 
 /// Everything that can wake the UI loop.
+/// The stdin reader thread stops reading while set, so it can't swallow the
+/// password typed into an ssh login prompt.
+pub static INPUT_PAUSED: AtomicBool = AtomicBool::new(false);
+
 pub enum Msg {
     Data, // a worker has news
     Input(Vec<u8>),
@@ -41,6 +50,7 @@ pub enum Act {
     View,
     Theme,
     Mouse,
+    Login,
     FoldAll,
     Fold(usize),  // host index
     FoldN(usize), // N-th host on screen
@@ -202,6 +212,7 @@ fn keymap(k: Key) -> Option<Act> {
         Char('l' | 'v') => Act::View,
         Char('t') => Act::Theme,
         Char('m') => Act::Mouse,
+        Char('L') => Act::Login,
         Char('a') => Act::FoldAll,
         Char(d @ '1'..='9') => Act::FoldN(d as usize - '1' as usize),
         Up | Char('k') => Act::Scroll(-1),
@@ -235,6 +246,7 @@ pub fn want_level(st: &Settings) -> u8 {
 pub struct App {
     pub st: Settings,
     workers: Vec<Arc<Worker>>,
+    prompted: Vec<bool>, // hosts whose login we already asked for unprompted
     names: Vec<String>,
     renderer: Renderer,
     rx: Receiver<Msg>,
@@ -268,6 +280,7 @@ impl App {
         let names = workers.iter().map(|w| w.host.lock().unwrap().name.clone()).collect();
         App {
             st,
+            prompted: vec![false; workers.len()],
             workers,
             names,
             renderer,
@@ -399,6 +412,10 @@ impl App {
                 self.renderer.th = Theme::new(if st.theme == "auto" { self.auto_theme } else { st.theme });
                 self.screen.invalidate();
             }
+            Act::Login => {
+                let need = self.needing_login();
+                self.login(need);
+            }
             Act::Mouse => {
                 st.mouse = !st.mouse;
                 self.screen.set_mouse(st.mouse);
@@ -452,11 +469,45 @@ impl App {
             l.pad(w);
             l
         });
-        let footer = footer_line(&self.st, w, &self.renderer.th, self.paused, &scroll_txt);
+        let login = snaps.iter().any(|h| h.needs_login);
+        let footer = footer_line(&self.st, w, &self.renderer.th, self.paused, &scroll_txt, login);
         let lines = std::iter::once(fr.header).chain(view).chain(std::iter::once(footer));
         let (cells, zones): (Vec<_>, Vec<_>) = lines.map(|l| (l.cells, l.zones)).unzip();
         self.zones = zones;
         self.screen.draw(cells, w, h);
+    }
+
+    fn needing_login(&self) -> Vec<usize> {
+        (0..self.workers.len()).filter(|&i| self.workers[i].host.lock().unwrap().needs_login).collect()
+    }
+
+    /// Hand the terminal to `ssh` so it can ask for a password (or a host key
+    /// confirmation) for each host, then take it back. Each success leaves a
+    /// master connection that the host's sessions ride on from then on.
+    fn login(&mut self, hosts: Vec<usize>) {
+        for &i in &hosts {
+            self.prompted[i] = true;
+        }
+        // without a terminal on stdin we can't hand it to ssh (it would stop on SIGTTIN)
+        if hosts.is_empty() || !std::io::stdin().is_terminal() {
+            return;
+        }
+        INPUT_PAUSED.store(true, SeqCst);
+        std::thread::sleep(Duration::from_millis(150)); // the reader is now polling, not reading
+        self.screen.leave();
+        term::restore();
+        for &i in &hosts {
+            let name = &self.names[i];
+            term::write_out(&format!("\nrgtop: {name} needs a login (Ctrl-C skips it)\n"));
+            if run_login(name, self.workers[i].timeout) {
+                self.workers[i].retry_now();
+            }
+        }
+        unsafe { libc::tcflush(0, libc::TCIFLUSH) }; // keys ssh didn't read
+        term::cbreak();
+        self.size = term::size();
+        self.screen.enter(self.st.mouse);
+        INPUT_PAUSED.store(false, SeqCst);
     }
 
     /// Stop on Ctrl-Z: hand the terminal back, resume cleanly on `fg`.
@@ -479,6 +530,9 @@ impl App {
         while !self.quit {
             let now = Instant::now();
             supervise(&self.workers, now, self.hard);
+            // a host that wants a password: ask once by ourselves, later on `L`
+            let need: Vec<usize> = self.needing_login().into_iter().filter(|&i| !self.prompted[i]).collect();
+            self.login(need);
             self.schedule(now);
             let seen = DATA_GEN.load(SeqCst);
             self.build(now, Some(now.duration_since(last).as_secs_f64().min(1.5 / FPS)));
@@ -558,6 +612,52 @@ impl App {
             }
         }
     }
+}
+
+/// One interactive `ssh` login, in the foreground of the terminal: its own
+/// process group, so Ctrl-C reaches ssh (skipping this host) and not rgtop.
+fn run_login(host: &str, timeout: u64) -> bool {
+    let sock = mux_socket(host);
+    if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        let _ = std::fs::remove_file(&sock); // a dead master's socket would block a new one
+    }
+    let args = login_command(host, timeout);
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..]);
+    unsafe {
+        cmd.pre_exec(|| {
+            // own group, made foreground here too so ssh never reads from the
+            // background (SIGTTIN); SIGTTOU ignored just for that call
+            libc::setpgid(0, 0);
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, libc::getpid());
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let Ok(child) = cmd.spawn() else { return false };
+    let pid = child.id() as i32;
+    let mut status = 0;
+    let ok = loop {
+        // ssh -f returns once logged in. Ctrl-Z at the prompt would stop it with
+        // nobody to resume it (it isn't the shell's job): continue it instead.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if r == pid && libc::WIFSTOPPED(status) {
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+            continue;
+        }
+        if r == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break r == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    };
+    unsafe {
+        // we're the background group now: taking the terminal back raises SIGTTOU
+        let old = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(0, libc::getpgrp());
+        libc::signal(libc::SIGTTOU, old);
+    }
+    ok
 }
 
 impl Drop for App {

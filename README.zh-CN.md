@@ -24,7 +24,7 @@
 
 ## 安装
 
-支持 macOS 和 Linux（x86_64 / arm64）。本机需要能用 SSH **免密**（密钥）登录各台服务器。服务器上只要装了 NVIDIA 驱动即可：有 python3（几乎所有 Linux 都有）时，rgtop 直接调用驱动自带的 NVML 库；没有时退回到运行 `nvidia-smi`。
+支持 macOS 和 Linux（x86_64 / arm64）。最省事的是用 SSH 密钥免密登录各台服务器；要输密码的服务器也能用，见[密码登录](#密码登录)。服务器上只要装了 NVIDIA 驱动即可：有 python3（几乎所有 Linux 都有）时，rgtop 直接调用驱动自带的 NVML 库；没有时退回到运行 `nvidia-smi`。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | sh
@@ -52,6 +52,16 @@ curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | RGT
 3. `~/.config/rgtop/hosts`：每行一个或多个别名，`#` 后是注释
 
 连不上的机器只显示一个红色错误卡片并按退避间隔重连，不影响其他机器。
+
+## 密码登录
+
+要输密码、动态口令，或者第一次连接要确认主机指纹的服务器，也能直接用。rgtop 会暂时退出全屏，由 `ssh` 自己来问：rgtop 看不到、也不保存你的密码。登录成功后，`ssh` 会在后台把这次登录保持 8 小时（OpenSSH 的连接复用，socket 在 `~/.ssh/rgtop-<主机名>`），这段时间里断线重连、重新打开 rgtop 都不用再输。
+
+- 启动时，每台需要登录的机器会自动问一次；在提示处按 `Ctrl-C` 跳过这台。
+- 登录过期后，卡片上会提示：按 `L`（或点底栏的 `L login`）重新登录。
+- 想提前断开登录：`ssh -O exit -o ControlPath=~/.ssh/rgtop-<主机名> <主机名>`。
+
+常用的服务器还是建议配密钥：执行一次 `ssh-copy-id <主机名>`，以后就再也不用输密码了。
 
 ## 环境变量
 
@@ -106,6 +116,7 @@ rgtop --reset      # 忽略保存的设置
 | `↑` `↓` `PgUp` `PgDn` `g` `G` 滚轮 | 滚动 |
 | `t` | 配色：auto（按终端背景自动选）、dark、light |
 | `m` | 开关鼠标捕获（关掉后可以选中复制文字） |
+| `L` | 登录需要密码的机器，见[密码登录](#密码登录) |
 | `?` / `q` | 帮助 / 退出 |
 
 底栏和 btop 一样，每个按钮都能用鼠标点。刷新间隔、排序、各个开关、视图、配色、折叠了哪些机器，退出时保存到 `~/.config/rgtop/settings.json`。

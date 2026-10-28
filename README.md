@@ -24,7 +24,7 @@
 
 ## Install
 
-macOS and Linux, x86_64 and arm64. You need key-based (password-less) SSH to each server. The servers need only the NVIDIA driver; with python3 (on practically every Linux) rgtop reads the driver's NVML library directly, otherwise it falls back to running `nvidia-smi`.
+macOS and Linux, x86_64 and arm64. Key-based SSH to each server is smoothest; servers that ask for a password work too (see [Password login](#password-login)). The servers need only the NVIDIA driver; with python3 (on practically every Linux) rgtop reads the driver's NVML library directly, otherwise it falls back to running `nvidia-smi`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | sh
@@ -52,6 +52,16 @@ rgtop connects to **Host aliases** from `~/.ssh/config` (see `ssh_config.example
 3. `~/.config/rgtop/hosts`: one or more aliases per line, `#` starts a comment
 
 A host that can't be reached shows a red error card and retries with backoff; the others are unaffected.
+
+## Password login
+
+Servers that want a password, a one-time code or a new host key confirmed work too. rgtop steps out of the full screen and `ssh` itself asks: rgtop never sees or stores the password. `ssh` then keeps the login open in the background for 8 hours (OpenSSH connection sharing, socket `~/.ssh/rgtop-<host>`), so reconnects and new rgtop sessions in that time don't ask again.
+
+- rgtop asks once at startup for each such host; `Ctrl-C` at the prompt skips that host.
+- When a login has expired, the card says so: press `L` (or click `L login` in the bottom bar) to log in again.
+- To end a login early: `ssh -O exit -o ControlPath=~/.ssh/rgtop-<host> <host>`.
+
+For servers you use a lot, a key is still smoother: run `ssh-copy-id <host>` once and nothing asks again.
 
 ## Environment variables
 
@@ -106,6 +116,7 @@ rgtop --reset      # ignore saved settings
 | `↑` `↓` `PgUp` `PgDn` `g` `G` wheel | scroll |
 | `t` | theme: auto (from the terminal background), dark, light |
 | `m` | mouse capture on/off (off lets you select text) |
+| `L` | log in to hosts that want a password, see [Password login](#password-login) |
 | `?` / `q` | help / quit |
 
 Every button in the bottom bar is clickable, like btop. Interval, sort, toggles, view, theme and folded hosts are saved to `~/.config/rgtop/settings.json` on exit.

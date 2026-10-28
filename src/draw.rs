@@ -896,7 +896,9 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
             for part in wrap(err, cw.max(10)).into_iter().take(if folded { 1 } else { 2 }) {
                 body.push(line(&part, th.err));
             }
-            if !retry.is_empty() && !folded {
+            if h.needs_login {
+                body.push(line("press L to log in (ssh asks for the password)", th.warn));
+            } else if !retry.is_empty() && !folded {
                 body.push(line(&retry, th.dim));
             }
         }
@@ -943,6 +945,7 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
     }
     match h.status {
         Status::Error => {
+            let retry = if h.needs_login { "press L to log in".into() } else { retry };
             let sep = if retry.is_empty() { "" } else { " · " };
             body.push(line(&format!("! {}{sep}{retry}", h.error.as_deref().unwrap_or("")), th.warn));
         }
@@ -1155,7 +1158,7 @@ fn button(label: &str, hot: &str, a: Act, th: &Theme, on: Option<bool>) -> Line 
     ln
 }
 
-pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt: &str) -> Line {
+pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt: &str, login: bool) -> Line {
     let mut sort = Line::default();
     sort.act("← ", th.key, Act::SortPrev).act(st.sort, th.on, Act::SortNext).act(" →", th.key, Act::SortNext);
     let mut interval = Line::default();
@@ -1173,7 +1176,10 @@ pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt
         ("list", button("list", "l", Act::View, th, Some(st.view == "list"))),
         ("pause", button("pause", "␣", Act::Pause, th, Some(paused))),
     ];
+    let mut login_btn = Line::default();
+    login_btn.act("L ", th.key, Act::Login).act("login", th.warn_on, Act::Login);
     let right = [
+        ("login", login.then_some(login_btn)), // a host wants a password
         ("scroll", (!scroll_txt.is_empty()).then(|| line(scroll_txt, th.dim))),
         ("int", Some(interval)),
         ("theme", Some(button(&format!("theme {}", st.theme), "t", Act::Theme, th, None))),
@@ -1228,6 +1234,7 @@ const HELP: &[(&str, &str)] = &[
     ("↑ ↓ PgUp PgDn", "scroll (also j / k, g / G, mouse wheel)"),
     ("t", "theme: auto → dark → light"),
     ("m", "mouse capture on / off (off = select text with the mouse)"),
+    ("L", "log in to hosts that want a password (ssh asks; kept 8 h)"),
     ("q", "quit            esc  ?   close this help"),
     ("Mouse", ""),
     ("click", "bottom-bar buttons · host title folds it · list row opens it"),

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
@@ -52,6 +53,47 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'"'"'"#))
 }
 
+/// Where `rgtop` keeps a host's login when the host wants a password: an
+/// OpenSSH master connection (ControlMaster) that later sessions ride on.
+pub fn mux_socket(host: &str) -> PathBuf {
+    let safe: String =
+        host.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".ssh").join(format!("rgtop-{safe}"))
+}
+
+/// Errors only an interactive login can fix: a password / one-time code, or a
+/// host key to confirm. rgtop runs ssh with BatchMode, which never asks.
+pub fn is_auth_error(msg: &str) -> bool {
+    [
+        "Permission denied",
+        "Host key verification failed",
+        "Too many authentication failures",
+        "No more authentication methods",
+    ]
+    .iter()
+    .any(|p| msg.contains(p))
+}
+
+/// Interactive login: ssh asks for the password itself (rgtop never sees it),
+/// then stays in the background for 8 h as the master connection.
+pub fn login_command(host: &str, timeout: u64) -> Vec<String> {
+    let mut v: Vec<String> = ["ssh", "-f", "-N"].map(String::from).to_vec();
+    for o in [
+        "ControlMaster=yes".to_string(),
+        format!("ControlPath={}", mux_socket(host).display()),
+        "ControlPersist=8h".into(),
+        format!("ConnectTimeout={timeout}"),
+        "ClearAllForwardings=yes".into(),
+        "RemoteCommand=none".into(),
+        "PermitLocalCommand=no".into(),
+        "LogLevel=ERROR".into(),
+    ] {
+        v.extend(["-o".into(), o]);
+    }
+    v.extend(["--".into(), host.into()]);
+    v
+}
+
 pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
     // agent.py if this python3 can run it (-I -S: no user site, PYTHONPATH or
     // sitecustomize, just the stdlib); it execs agent.sh itself if NVML is unusable
@@ -72,6 +114,11 @@ pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
     ] {
         v.push("-o".into());
         v.push(o);
+    }
+    let sock = mux_socket(host);
+    if sock.exists() {
+        // logged in through rgtop: ride on that connection (no password needed)
+        v.extend(["-o".into(), "ControlMaster=no".into(), "-o".into(), format!("ControlPath={}", sock.display())]);
     }
     v.extend(["--".into(), host.into(), remote]);
     v
@@ -424,6 +471,7 @@ pub struct Host {
     pub sample: Option<Arc<Sample>>,
     pub updated: Instant,
     pub latency: Option<f64>, // request -> frame round trip of the last sample
+    pub needs_login: bool,    // failed in a way only an interactive login fixes
     pub history: Arc<History>,
 }
 
@@ -439,6 +487,7 @@ impl Host {
             sample: None,
             updated: now,
             latency: None,
+            needs_login: false,
             history: Arc::default(),
         }
     }
@@ -448,6 +497,7 @@ impl Host {
     }
 
     fn failed(&mut self, msg: String, retry_at: Option<Instant>) {
+        self.needs_login = is_auth_error(&msg);
         (self.status, self.error, self.retry_at) = (Status::Error, Some(msg), retry_at);
         self.since = Instant::now();
     }
@@ -456,6 +506,7 @@ impl Host {
         let now = Instant::now();
         Arc::make_mut(&mut self.history).push(&s, now); // copies only if the UI still holds the old one
         (self.sample, self.status, self.error, self.retry_at) = (Some(Arc::new(s)), Status::Ok, None, None);
+        self.needs_login = false;
         (self.updated, self.latency) = (now, latency);
     }
 }
@@ -472,7 +523,7 @@ struct Io {
 /// still in flight.
 pub struct Worker {
     pub host: Arc<Mutex<Host>>,
-    cmd: Vec<String>,
+    pub timeout: u64,
     once: bool,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
@@ -481,12 +532,13 @@ pub struct Worker {
     pid: AtomicI32,
     kill_reason: Mutex<Option<String>>,
     pub done: AtomicBool,
+    retry_now: AtomicBool,
 }
 
 impl Worker {
     pub fn new(
         name: &str,
-        cmd: Vec<String>,
+        timeout: u64,
         once: bool,
         tx: Sender<Msg>,
         stop: Arc<AtomicBool>,
@@ -494,7 +546,7 @@ impl Worker {
     ) -> Self {
         Worker {
             host: Arc::new(Mutex::new(Host::new(name))),
-            cmd,
+            timeout,
             once,
             tx,
             stop,
@@ -503,6 +555,7 @@ impl Worker {
             pid: AtomicI32::new(0),
             kill_reason: Mutex::new(None),
             done: AtomicBool::new(false),
+            retry_now: AtomicBool::new(false),
         }
     }
 
@@ -562,8 +615,10 @@ impl Worker {
             // open (that host would never see EOF). Serialize pipe creation + spawn.
             let guard = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
             let child = std::io::pipe().and_then(|(reader, writer)| {
-                let mut cmd = Command::new(&self.cmd[0]);
-                cmd.args(&self.cmd[1..]).stdin(Stdio::piped()).stdout(writer.try_clone()?).stderr(writer);
+                // rebuilt every time: a login (mux socket) may have appeared meanwhile
+                let args = ssh_command(&self.host.lock().unwrap().name.clone(), self.timeout);
+                let mut cmd = Command::new(&args[0]);
+                cmd.args(&args[1..]).stdin(Stdio::piped()).stdout(writer.try_clone()?).stderr(writer);
                 // ssh gets its own session: no controlling tty (a prompt can't draw
                 // over the UI), Ctrl-C doesn't reach it, and killpg also takes down
                 // a ProxyCommand child. setsid() is async-signal-safe.
@@ -649,7 +704,7 @@ impl Worker {
             self.host.lock().unwrap().failed(msg, Some(Instant::now() + retry));
             self.notify();
             let until = Instant::now() + retry;
-            while Instant::now() < until {
+            while Instant::now() < until && !self.retry_now.swap(false, SeqCst) {
                 if self.stop.load(SeqCst) {
                     return;
                 }
@@ -657,6 +712,11 @@ impl Worker {
             }
             backoff = (backoff * 2.0).min(30.0);
         }
+    }
+
+    /// Skip the rest of the backoff wait (e.g. right after a login).
+    pub fn retry_now(&self) {
+        self.retry_now.store(true, SeqCst);
     }
 
     pub fn kill(&self, reason: Option<&str>) {
@@ -747,6 +807,18 @@ mod tests {
         assert_eq!(parse_frame(&lines, None).gpu_error.as_deref(), Some(err));
         let lines: Vec<String> = ["@@G 127".to_string()].to_vec();
         assert!(parse_frame(&lines, None).gpu_error.unwrap().starts_with("no NVIDIA driver"));
+    }
+
+    #[test]
+    fn auth_errors_and_logins() {
+        assert!(is_auth_error("alice@10.0.0.1: Permission denied (publickey,password)."));
+        assert!(is_auth_error("Host key verification failed."));
+        assert!(!is_auth_error("ssh: connect to host 10.0.0.1 port 22: Operation timed out"));
+        let s = mux_socket("gpu/a b");
+        assert!(s.ends_with(".ssh/rgtop-gpu_a_b"));
+        let cmd = login_command("gpu-1", 8);
+        assert!(cmd.contains(&"ControlMaster=yes".to_string()) && !cmd.iter().any(|a| a.contains("BatchMode")));
+        assert_eq!(cmd.last().map(String::as_str), Some("gpu-1"));
     }
 
     #[test]

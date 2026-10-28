@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use app::{App, Msg, want_level};
-use collect::{Worker, ssh_command, supervise};
+use app::{App, INPUT_PAUSED, Msg, want_level};
+use collect::{Worker, supervise};
 use draw::{FPS, Renderer};
 use settings::{Settings, THEMES, choice, config_dir, config_file, load_settings, save_settings};
 use theme::{Theme, detect_theme};
@@ -223,7 +223,7 @@ fn run() -> i32 {
     let want = Arc::new(AtomicU8::new(want_level(&st)));
     let workers: Vec<Arc<Worker>> = hosts
         .iter()
-        .map(|h| Arc::new(Worker::new(h, ssh_command(h, args.timeout), !live, tx.clone(), stop.clone(), want.clone())))
+        .map(|h| Arc::new(Worker::new(h, args.timeout, !live, tx.clone(), stop.clone(), want.clone())))
         .collect();
     let hard = args.timeout as f64 + 7.0;
 
@@ -247,16 +247,23 @@ fn run() -> i32 {
         if std::io::stdin().is_terminal() {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                use std::io::Read;
+                // poll, then read: while INPUT_PAUSED (an ssh login owns the
+                // terminal) nothing is read, so the password goes to ssh
                 let mut buf = [0u8; 1024];
                 loop {
-                    match std::io::stdin().read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = tx.send(Msg::Input(buf[..n].to_vec()));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                    let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+                    if INPUT_PAUSED.load(SeqCst) {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 || INPUT_PAUSED.load(SeqCst) {
+                        continue;
+                    }
+                    let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n > 0 {
+                        let _ = tx.send(Msg::Input(buf[..n as usize].to_vec()));
+                    } else if n == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break;
                     }
                 }
                 let _ = tx.send(Msg::InputEof);
