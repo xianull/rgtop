@@ -6,6 +6,7 @@ n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)
 me=$(id -un 2>/dev/null)
 command -v nvidia-smi >/dev/null 2>&1 || nosmi=1
 while read -r req; do
+  [ "$req" = k ] && continue # keepalive from rgtop
   echo @@B
   echo "@@S $(head -n1 /proc/stat 2>/dev/null)"
   if [ -z "$nosmi" ]; then

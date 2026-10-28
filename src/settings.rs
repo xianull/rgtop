@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 pub const INTERVAL_MIN_MS: u64 = 100;
+/// interval_ms == AUTO: sample as fast as each host answers (up to AUTO_TICK_MS)
+pub const AUTO: u64 = 0;
+pub const AUTO_TICK_MS: u64 = 50;
 pub const INTERVAL_MAX_MS: u64 = 600_000;
 pub const SORTS: [&str; 4] = ["host", "idle", "vram", "util"];
 pub const VIEWS: [&str; 2] = ["cards", "list"];
@@ -18,6 +21,7 @@ pub struct Settings {
     pub free_only: bool, // hide busy GPUs
     pub view: &'static str,
     pub show_cpu: bool,
+    pub show_cores: bool, // per-core strip under the CPU row
     pub show_hist: bool,
     pub show_user: bool,
     pub show_proc: bool,
@@ -35,6 +39,7 @@ impl Default for Settings {
             free_only: false,
             view: "cards",
             show_cpu: true,
+            show_cores: true,
             show_hist: true,
             show_user: true,
             show_proc: false,
@@ -84,12 +89,13 @@ pub fn load_settings(path: &Path) -> Settings {
     flag("reverse", &mut st.reverse);
     flag("free_only", &mut st.free_only);
     flag("show_cpu", &mut st.show_cpu);
+    flag("show_cores", &mut st.show_cores);
     flag("show_hist", &mut st.show_hist);
     flag("show_user", &mut st.show_user);
     flag("show_proc", &mut st.show_proc);
     flag("mouse", &mut st.mouse);
     if let Some(v) = d.get("interval_ms").and_then(Value::as_u64) {
-        st.interval_ms = v.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS);
+        st.interval_ms = if v == AUTO { AUTO } else { v.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS) };
     }
     let pick = |k: &str, of: &[&'static str], cur: &mut &'static str| {
         if let Some(v) = d.get(k).and_then(Value::as_str).and_then(|v| choice(v, of)) {
@@ -108,7 +114,7 @@ pub fn load_settings(path: &Path) -> Settings {
 pub fn save_settings(path: &Path, st: &Settings) {
     let v = json!({
         "interval_ms": st.interval_ms, "sort": st.sort, "reverse": st.reverse,
-        "free_only": st.free_only, "view": st.view, "show_cpu": st.show_cpu,
+        "free_only": st.free_only, "view": st.view, "show_cpu": st.show_cpu, "show_cores": st.show_cores,
         "show_hist": st.show_hist, "show_user": st.show_user, "show_proc": st.show_proc,
         "theme": st.theme, "mouse": st.mouse, "collapsed": st.collapsed,
     });
@@ -120,17 +126,23 @@ pub fn save_settings(path: &Path, st: &Settings) {
     }
 }
 
-/// The interval 100 ms up (dir > 0) or down from `ms`, like btop's + / -.
+/// The interval 100 ms up (dir > 0) or down from `ms`, like btop's + / -;
+/// below 100 ms is AUTO.
 pub fn step_interval(ms: u64, dir: i32) -> u64 {
     let ms = (ms + 50) / 100 * 100; // snap e.g. a 250 from -n 0.25 onto the grid
-    let next = if dir > 0 { ms + 100 } else { ms.saturating_sub(100) };
-    next.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS)
+    match (ms, dir > 0) {
+        (AUTO, true) => INTERVAL_MIN_MS,
+        (..=INTERVAL_MIN_MS, false) => AUTO,
+        (_, true) => (ms + 100).min(INTERVAL_MAX_MS),
+        (_, false) => ms - 100,
+    }
 }
 
 /// 100ms, 1.5s, 2s
 pub fn fmt_interval(ms: u64) -> String {
     match ms {
-        ..1000 => format!("{ms}ms"),
+        AUTO => "auto".into(),
+        1..1000 => format!("{ms}ms"),
         _ if ms.is_multiple_of(1000) => format!("{}s", ms / 1000),
         _ => format!("{:.1}s", ms as f64 / 1000.0),
     }
@@ -159,7 +171,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(step_interval(2000, 1), 2100);
         assert_eq!(step_interval(200, -1), 100);
-        assert_eq!(step_interval(100, -1), 100);
+        assert_eq!(step_interval(100, -1), AUTO);
+        assert_eq!(step_interval(AUTO, -1), AUTO);
+        assert_eq!(step_interval(AUTO, 1), 100);
+        assert_eq!(fmt_interval(AUTO), "auto");
         assert_eq!(step_interval(250, 1), 400);
         assert_eq!([fmt_interval(100), fmt_interval(1500), fmt_interval(2000)], ["100ms", "1.5s", "2s"]);
     }

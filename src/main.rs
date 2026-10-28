@@ -41,7 +41,8 @@ usage: rgtop [options] [HOST ...]
 
   HOST              ssh host aliases (default: $RGTOP_HOSTS, else {cfg}/hosts)
   -1, --once        print one snapshot and exit (implied when stdout is not a terminal)
-  -n, --interval S  refresh interval in seconds, from 0.1; -/+ adjust it live by 100 ms
+  -n, --interval S  refresh interval in seconds, from 0.1, or auto (as fast as hosts answer);
+                    -/+ adjust it live by 100 ms
                     (default: saved, else 2)
   -t, --timeout S   SSH connect timeout in seconds (default: 8)
       --theme T     auto | dark | light (default: saved, else $RGTOP_THEME, else auto)
@@ -76,7 +77,8 @@ fn parse_args() -> Result<Args, String> {
             "-1" | "--once" => a.once = true,
             "-n" | "--interval" => {
                 let v = value(&flag)?;
-                a.interval = Some(v.parse().ok().filter(|x: &f64| x.is_finite()).ok_or(format!("bad interval: {v}"))?);
+                let iv = if v == "auto" { Some(0.0) } else { v.parse().ok().filter(|x: &f64| x.is_finite()) };
+                a.interval = Some(iv.ok_or(format!("bad interval: {v}"))?);
             }
             "-t" | "--timeout" => {
                 let v = value(&flag)?;
@@ -204,7 +206,7 @@ fn run() -> i32 {
         st.theme = t;
     }
     if let Some(iv) = args.interval {
-        st.interval_ms = (iv.clamp(0.1, 600.0) * 1000.0).round() as u64;
+        st.interval_ms = if iv <= 0.0 { settings::AUTO } else { (iv.clamp(0.1, 600.0) * 1000.0).round() as u64 };
     }
 
     let tty = std::io::stdout().is_terminal();

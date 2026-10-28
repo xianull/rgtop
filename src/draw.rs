@@ -10,13 +10,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::Act;
 use crate::collect::{Gpu, HISTORY, Host, Proc, Sample, Status, UNKNOWN};
-use crate::settings::{SORTS, Settings, fmt_interval};
+use crate::settings::{AUTO, AUTO_TICK_MS, SORTS, Settings, fmt_interval};
 use crate::term::{BLANK, Cell, PLAIN, Style, WIDE_TAIL};
 use crate::theme::Theme;
 
-pub const FPS: f64 = 60.0; // frame rate while something is animating
-const TWEEN_TAU: f64 = 0.12; // seconds; easing time constant (less when sampling faster than ~3/s)
-const PULSE_SECS: f64 = 0.6; // status dot glows after each fresh sample (intervals of 1 s and up)
+pub const FPS: f64 = 30.0; // while something is animating; every frame is a terminal redraw
+const TWEEN_TAU: f64 = 0.07; // seconds; easing time constant: settled ~0.3 s after a sample
+const PULSE_SECS: f64 = 0.5; // status dot glows after each fresh sample (intervals of 1 s and up)
 const CARD_MIN_WIDTH: usize = 80; // narrower terminals get fewer card columns
 const PROC_MAX: usize = 8; // process rows per host card
 
@@ -496,9 +496,10 @@ fn host_state(gpus: &[Gpu]) -> usize {
     gpus.iter().map(Gpu::state).min().unwrap_or(2)
 }
 
-/// 1 right after a fresh sample, fading out (ease-out) over PULSE_SECS.
+/// 1 right after a fresh sample, fading out (ease-out) over PULSE_SECS, in
+/// 8 steps: a continuous fade would redraw the terminal on every frame.
 fn glow(age: f64) -> f64 {
-    (1.0 - age / PULSE_SECS).max(0.0).powi(2)
+    ((1.0 - age / PULSE_SECS).max(0.0).powi(2) * 8.0).round() / 8.0
 }
 
 fn status_dot(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host) -> (char, Style) {
@@ -569,7 +570,8 @@ fn sys_rows(
     cpu: f64,
     used: f64,
     cache: f64,
-) -> [Line; 2] {
+    cores_row: bool,
+) -> Vec<Line> {
     let mut ln = line(&ljust("CPU", c.prefix), th.dim);
     put_bar(&mut ln, cpu, c.bar_u, th);
     let cpu = s.cpu_pct.map(|_| cpu);
@@ -578,14 +580,16 @@ fn sys_rows(
     let tot = s.mem_total_kb as f64 / 1048576.0;
     let txt = if tot > 0.0 { format!("{}/{}G", D0(used / 100.0 * tot), D0(tot)) } else { "-".into() };
     ln.add(&rjust(&txt, MEM_W), PLAIN);
-    let swap_used = s.swap_total_kb.saturating_sub(s.swap_free_kb);
-    let swap = (s.swap_total_kb > 0).then(|| {
-        let st = if swap_used > s.swap_total_kb / 4 { th.warn } else { th.dim }; // a quarter used: worth a look
-        (format!("swap {}", fmt_gib(swap_used)), st)
-    });
+    let n = s.cores.unwrap_or(1).max(1);
+    let load_st = |l: f64| th.level(Some(l / n as f64 / 1.2 * 100.0));
     if c.user > 0 {
-        let (t, st) = swap.clone().unwrap_or_default();
-        ln.add("  ", PLAIN).add(&ljust(&cut(&t, c.user), c.user), st);
+        ln.add("  ", PLAIN);
+        // 1-minute load / cores, e.g. "40.9/192c"
+        let mut cell = Line::new();
+        if let Some(l) = s.load {
+            cell.add(&D1(l[0]).to_string(), load_st(l[0])).add(&format!("/{n}c"), th.dim);
+        }
+        ln.extend(cell.fit(c.user));
     }
     if c.spark > 0 {
         ln.add("  ", PLAIN);
@@ -596,17 +600,21 @@ fn sys_rows(
         Some(t) => ln.add(&format!("{:>3}°", D0(t)), th.temp(t)),
         None => ln.add(&rjust("-", TEMP_W), th.dim),
     };
+    if !cores_row {
+        return vec![ln];
+    }
 
+    let swap_used = s.swap_total_kb.saturating_sub(s.swap_free_kb);
     let label = s.cores.map_or(String::new(), |n| format!("{n}c"));
     let mut r2 = line(&ljust(&label, c.prefix.max(label.len() + 1)), th.dim);
     let mut right = Line::default();
     if let Some(l) = s.load {
-        let n = s.cores.unwrap_or(1).max(1) as f64;
-        right.add("load ", th.dim).add(&D1(l[0]).to_string(), th.level(Some(l[0] / n / 1.2 * 100.0)));
+        right.add("load ", th.dim).add(&D1(l[0]).to_string(), load_st(l[0]));
         right.add(&format!(" {} {}", D1(l[1]), D1(l[2])), th.dim);
     }
-    if let Some((t, st)) = swap.filter(|_| c.user == 0) {
-        right.add("  ", PLAIN).add(&t, st);
+    if s.swap_total_kb > 0 {
+        let st = if swap_used > s.swap_total_kb / 4 { th.warn } else { th.dim }; // a quarter used: worth a look
+        right.add("  swap ", th.dim).add(&fmt_gib(swap_used), st);
     }
     let room = cw.saturating_sub(r2.w() + right.w() + 2);
     if !s.core_pct.is_empty() && room >= 8 {
@@ -614,7 +622,7 @@ fn sys_rows(
         put_strip(&mut r2, s.core_pct.chunks(g).map(|ch| Some(ch.iter().fold(0.0f32, |a, &b| a.max(b)) as f64)), th);
     }
     r2.pad(cw.saturating_sub(r2.w() + right.w())).extend(&right);
-    [ln, r2]
+    vec![ln, r2]
 }
 
 fn gpu_header(c: &Cols, th: &Theme) -> Line {
@@ -905,7 +913,7 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
         let cpu = tw.ease((i, K_CPU), s.cpu_pct.unwrap_or(0.0), 0.0);
         let used = tw.ease((i, K_RAM), ram_pct(s).unwrap_or(0.0), 0.0);
         let cache = tw.ease((i, K_CACHE), cache_pct(s), 0.0);
-        body.extend(sys_rows(s, &h.history.cpu, &c, cw, th, cpu, used, cache));
+        body.extend(sys_rows(s, &h.history.cpu, &c, cw, th, cpu, used, cache, st.show_cores));
     }
     let vis: Vec<&Gpu> = s.gpus.iter().filter(|g| !st.free_only || g.state() < 2).collect();
     if !vis.is_empty() {
@@ -1158,6 +1166,7 @@ pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt
         ("rev", button("reverse", "r", Act::Rev, th, Some(st.reverse))),
         ("free", button("free", "f", Act::Free, th, Some(st.free_only))),
         ("cpu", button("cpu", "c", Act::Cpu, th, Some(st.show_cpu))),
+        ("cores", button("cores", "o", Act::Cores, th, Some(st.show_cores))),
         ("hist", button("hist", "h", Act::Hist, th, Some(st.show_hist))),
         ("user", button("user", "u", Act::User, th, Some(st.show_user))),
         ("proc", button("proc", "p", Act::Proc, th, Some(st.show_proc))),
@@ -1171,7 +1180,7 @@ pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt
         ("help", Some(button("help", "?", Act::Help, th, None))),
         ("quit", Some(button("quit", "q", Act::Quit, th, None))),
     ];
-    let drop = ["theme", "scroll", "hist", "cpu", "rev", "help", "user", "free", "pause", "proc", "list"];
+    let drop = ["theme", "scroll", "cores", "hist", "cpu", "rev", "help", "user", "free", "pause", "proc", "list"];
     let build = |skip: &[&str]| {
         let (mut l, mut r) = (line(" ", PLAIN), Line::default());
         for (name, seg) in &left {
@@ -1210,10 +1219,10 @@ const HELP: &[(&str, &str)] = &[
     ("Keys", ""),
     ("← →   < >", "sort hosts: host · idle · vram · util"),
     ("r", "reverse sort"),
-    ("−  +", "refresh interval ±100 ms, from 100 ms (applies instantly)"),
+    ("−  +", "refresh interval ±100 ms; below 100 ms: auto, as fast as hosts answer"),
     ("space   enter", "pause / resume sampling · sample now"),
     ("f", "free only: hide busy GPUs"),
-    ("c h u p", "toggle CPU line · util history · GPU user · process list"),
+    ("c o h u p", "toggle CPU rows · per-core strip · util history · GPU user · processes"),
     ("l", "list view: one row per host"),
     ("1-9   a", "fold host N · fold / unfold all"),
     ("↑ ↓ PgUp PgDn", "scroll (also j / k, g / G, mouse wheel)"),
@@ -1412,7 +1421,7 @@ impl Renderer {
         paused: bool,
         help_on: bool,
     ) -> Frame {
-        let iv = st.interval_ms as f64 / 1000.0;
+        let iv = if st.interval_ms == AUTO { AUTO_TICK_MS } else { st.interval_ms } as f64 / 1000.0;
         self.tw.begin(dt, TWEEN_TAU.min(iv / 3.0)); // settle well before the next sample
         let cx = Ctx {
             th: &self.th,

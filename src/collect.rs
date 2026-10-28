@@ -28,7 +28,9 @@ pub static DATA_GEN: AtomicU64 = AtomicU64::new(0);
 pub static UI_BUSY: AtomicBool = AtomicBool::new(false);
 
 pub const HISTORY: usize = 240; // history points kept per GPU / CPU for the sparklines
-const BUCKET: Duration = Duration::from_millis(950); // samples closer than this share one point (max)
+// one history point per sample, but samples closer than this share one (max), so
+// at 100 ms / auto a sparkline still spans a minute rather than seconds
+const BUCKET: Duration = Duration::from_millis(240);
 const IDLE_PCT: f64 = 5.0; // util AND mem below this -> idle  (green)
 const LIGHT_PCT: f64 = 40.0; // util AND mem below this -> light (yellow), otherwise busy (red)
 pub const UNKNOWN: &str = "?"; // owner of a GPU process whose PID isn't visible on the host
@@ -37,6 +39,11 @@ pub const UNKNOWN: &str = "?"; // owner of a GPU process whose PID isn't visible
 pub const WANT_SYS: u8 = 0; // system + GPUs
 pub const WANT_PROCS: u8 = 1; // + GPU processes (USER column)
 pub const WANT_HOST: u8 = 2; // + top CPU users of the host (process list)
+
+/// The agent exits after 60 s without input: a connection whose close never
+/// reached the server (proxies, VPNs, sleep) would otherwise leave it running
+/// for good. So every host hears from us at least this often, paused or not.
+const KEEPALIVE: Duration = Duration::from_secs(15);
 
 const AGENT_PY: &str = include_str!("agent.py");
 const AGENT_SH: &str = include_str!("agent.sh");
@@ -453,6 +460,12 @@ impl Host {
     }
 }
 
+struct Io {
+    stdin: Option<ChildStdin>, // the request pipe
+    sent: Option<Instant>,     // a request is in flight since
+    wrote: Instant,            // last write of any kind (keepalive)
+}
+
 // ── worker ───────────────────────────────────────────────────────────────────
 /// Owns the SSH session for one host; reconnects with backoff in live mode.
 /// `request()` is called by the UI scheduler and is a no-op while a sample is
@@ -463,8 +476,8 @@ pub struct Worker {
     once: bool,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
-    want: Arc<AtomicU8>,                              // WANT_*
-    io: Mutex<(Option<ChildStdin>, Option<Instant>)>, // (request pipe, request sent at)
+    want: Arc<AtomicU8>, // WANT_*
+    io: Mutex<Io>,
     pid: AtomicI32,
     kill_reason: Mutex<Option<String>>,
     pub done: AtomicBool,
@@ -486,7 +499,7 @@ impl Worker {
             tx,
             stop,
             want,
-            io: Mutex::new((None, None)),
+            io: Mutex::new(Io { stdin: None, sent: None, wrote: Instant::now() }),
             pid: AtomicI32::new(0),
             kill_reason: Mutex::new(None),
             done: AtomicBool::new(false),
@@ -502,10 +515,10 @@ impl Worker {
 
     pub fn request(&self) -> bool {
         let mut io = self.io.lock().unwrap();
-        if io.1.is_some() {
+        if io.sent.is_some() {
             return false;
         }
-        let Some(stdin) = io.0.as_mut() else { return false };
+        let Some(stdin) = io.stdin.as_mut() else { return false };
         let req: &[u8] = match self.want.load(SeqCst) {
             WANT_HOST => b"h\n",
             WANT_PROCS => b"p\n",
@@ -515,10 +528,21 @@ impl Worker {
             return false;
         }
         if self.once {
-            io.0 = None; // one frame, then EOF ends the remote loop
+            io.stdin = None; // one frame, then EOF ends the remote loop
         }
-        io.1 = Some(Instant::now());
+        (io.sent, io.wrote) = (Some(Instant::now()), Instant::now());
         true
+    }
+
+    /// A no-op line for the agent if we haven't written for KEEPALIVE.
+    pub fn keepalive(&self) {
+        let mut io = self.io.lock().unwrap();
+        if io.wrote.elapsed() >= KEEPALIVE {
+            if let Some(stdin) = io.stdin.as_mut() {
+                let _ = stdin.write_all(b"k\n").and_then(|_| stdin.flush());
+            }
+            io.wrote = Instant::now();
+        }
     }
 
     pub fn run(&self) {
@@ -560,7 +584,10 @@ impl Worker {
                 }
             };
             self.pid.store(child.id() as i32, SeqCst);
-            *self.io.lock().unwrap() = (child.stdin.take(), None);
+            {
+                let mut io = self.io.lock().unwrap();
+                (io.stdin, io.sent) = (child.stdin.take(), None);
+            }
             if self.stop.load(SeqCst) {
                 self.kill(None);
             }
@@ -581,7 +608,7 @@ impl Worker {
                 if line == "@@B" {
                     frame = Some(Vec::new());
                 } else if line == "@@E" && frame.is_some() {
-                    let t0 = self.io.lock().unwrap().1.take();
+                    let t0 = self.io.lock().unwrap().sent.take();
                     let prev = self.host.lock().unwrap().sample.as_ref().and_then(|s| s.stat);
                     let s = parse_frame(&frame.take().unwrap(), prev);
                     self.host.lock().unwrap().push(s, t0.map(|t| t.elapsed().as_secs_f64()));
@@ -599,7 +626,10 @@ impl Worker {
             }
             let rc = child.wait().map(|s| s.code().unwrap_or_else(|| -s.signal().unwrap_or(0))).unwrap_or(-1);
             self.pid.store(0, SeqCst);
-            *self.io.lock().unwrap() = (None, None);
+            {
+                let mut io = self.io.lock().unwrap();
+                (io.stdin, io.sent) = (None, None);
+            }
             if self.stop.load(SeqCst) {
                 return;
             }

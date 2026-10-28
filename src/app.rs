@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collect::{DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, supervise};
 use crate::draw::{FPS, Line, Renderer, footer_line};
-use crate::settings::{SORTS, Settings, THEMES, VIEWS, step_interval};
+use crate::settings::{AUTO, AUTO_TICK_MS, SORTS, Settings, THEMES, VIEWS, step_interval};
 use crate::term::{self, Screen};
 use crate::theme::Theme;
 
@@ -34,6 +34,7 @@ pub enum Act {
     Refresh,
     Free,
     Cpu,
+    Cores,
     Hist,
     User,
     Proc,
@@ -194,6 +195,7 @@ fn keymap(k: Key) -> Option<Act> {
         Enter => Act::Refresh,
         Char('f') => Act::Free,
         Char('c') => Act::Cpu,
+        Char('o') => Act::Cores,
         Char('h') => Act::Hist,
         Char('u') => Act::User,
         Char('p') => Act::Proc,
@@ -287,8 +289,10 @@ impl App {
         }
     }
 
+    /// In auto mode every host is asked again as soon as it answered (a request
+    /// is a no-op while one is in flight), but at most every AUTO_TICK_MS.
     fn interval(&self) -> Duration {
-        Duration::from_millis(self.st.interval_ms)
+        Duration::from_millis(if self.st.interval_ms == AUTO { AUTO_TICK_MS } else { self.st.interval_ms })
     }
 
     // sampling ----------------------------------------------------------------
@@ -300,6 +304,9 @@ impl App {
     }
 
     fn schedule(&mut self, now: Instant) {
+        for w in &self.workers {
+            w.keepalive(); // paused or not
+        }
         if self.paused || now < self.next_tick {
             return;
         }
@@ -367,6 +374,7 @@ impl App {
             Act::Refresh => self.sample_now(),
             Act::Free => st.free_only = !st.free_only,
             Act::Cpu => st.show_cpu = !st.show_cpu,
+            Act::Cores => st.show_cores = !st.show_cores,
             Act::Hist => st.show_hist = !st.show_hist,
             Act::User | Act::Proc => {
                 let on = if a == Act::User { &mut st.show_user } else { &mut st.show_proc };

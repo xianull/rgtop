@@ -21,7 +21,7 @@ A btop-style live dashboard for NVIDIA GPUs, CPUs and memory on many remote serv
 ```
 
 - **GPU rows**: utilization, VRAM, who uses the card (`+N` = N more users, yours highlighted), utilization history, temperature, power. The dot is green when idle (util and VRAM < 5%), yellow when lightly used (< 40%), red when busy, and fades between them.
-- **CPU rows**: total CPU, RAM (used, then page cache in a muted tone), swap, CPU history and package temperature on the GPU columns; below them one cell per core (busiest core per cell when there are more cores than room) and the 1 / 5 / 15 min load.
+- **CPU rows**: total CPU, RAM (used, then page cache in a muted tone), 1-minute load, CPU history and package temperature on the GPU columns; below them (toggle with `o`) one cell per core (busiest core per cell when there are more cores than room), the 1 / 5 / 15 min load and swap.
 - **Process list** (`p`): the processes on each GPU with their current %CPU (100 = one core) and host RSS, plus the users keeping the host's CPUs busy right now.
 - Title: GPU and CPU models. Bottom edge: uptime and the request round trip.
 
@@ -62,16 +62,17 @@ A host that can't be reached shows a red error card and retries with backoff; th
 rgtop              # live dashboard
 rgtop -1           # print one snapshot and exit (automatic when stdout isn't a terminal)
 rgtop -n 0.1       # start with a 100 ms refresh interval
+rgtop -n auto      # as fast as each host answers (up to 20 samples/s)
 rgtop --reset      # ignore saved settings
 ```
 
 | Key | Action |
 | --- | --- |
-| `−` / `+` | refresh interval ±100 ms (from 100 ms), applies instantly |
+| `−` / `+` | refresh interval ±100 ms, applies instantly; below 100 ms is `auto`: every host is asked again as soon as it answered (up to 20/s) |
 | `←` / `→` | sort hosts: `host` (config order), `idle`, `vram` (most free first), `util` (least busy first) |
 | `r` | reverse the sort |
 | `f` | free only: hide busy GPUs |
-| `c` `h` `u` `p` | toggle CPU rows, utilization history, USER column, process list |
+| `c` `o` `h` `u` `p` | toggle CPU rows, per-core strip, utilization history, USER column, process list |
 | `l` | list view: one row per host; click a row to open its card |
 | `1`–`9` / `a` | fold host N / all hosts (or click a card title) |
 | `space` / `enter` | pause or resume sampling / sample now |
@@ -86,8 +87,9 @@ Every button in the bottom bar is clickable, like btop. Interval, sort, toggles,
 
 - **One SSH session per host, on demand.** The session runs a small agent that answers one request line with one frame, so the local side decides when to sample: interval changes apply instantly, pausing costs nothing, and no sample pays for a handshake. Lost connections retry after 2 s, 4 s, 8 s … up to 30 s.
 - **No forks per sample.** The agent (`src/agent.py`, Python 3 stdlib) reads GPUs through NVML and the host from `/proc` in-process: ~1 ms per sample, versus ~250 ms to start `nvidia-smi`. GPU process lists are refreshed once a second, the per-core strip twice a second, the host's top CPU users every 5 s in a background thread. On a host without python3, a shell agent running `nvidia-smi` takes over.
-- **Rendering.** Frames are rebuilt from scratch and diffed cell by cell against the previous one; only the changed span of each row is sent, inside a synchronized update (no tearing). It animates at 60 fps while something moves (bars, numbers and status dots ease) and sleeps otherwise.
-- **Measured** with 5 servers × 8 GPUs: at a 2 s interval rgtop uses 0.8% of one local core and the agent 0.8% of one server core; at 100 ms, 2.8% locally and 2.6% on the server (of 192 cores). Memory: 4 MiB.
+- **Rendering.** Frames are rebuilt from scratch and diffed cell by cell against the previous one; only the changed span of each row is sent, inside a synchronized update (no tearing). Bars, numbers and status dots ease at up to 30 fps for ~0.3 s after new data, then the screen is left alone: every frame is work for your terminal and the window server too.
+- **Measured** with 5 servers × 8 GPUs: at a 2 s interval rgtop uses 0.4% of one local core and ~6 terminal redraws/s, the agent 0.8% of one server core; at 100 ms, 1.9% locally (28 redraws/s) and 2.6% on the server (of 192 cores). Memory: 4 MiB.
+- **No leftovers.** rgtop pings every agent at least every 15 s, paused or not, and an agent that hears nothing for 60 s exits: a connection whose close never reached the server (proxies, VPNs, a sleeping laptop) can't leave it running.
 - **Details.** `ClearAllForwardings=yes`, so port forwards in `~/.ssh/config` aren't triggered; output of remote shell startup files is ignored and control characters from remote data never reach your terminal. CPU usage comes from `/proc/stat` deltas, RAM used is `MemTotal − MemAvailable`. A host with no fresh data for `max(3 × interval, interval + 8 s)` is marked `stale`.
 
 ## Development

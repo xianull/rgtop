@@ -4,7 +4,7 @@
 # (~1 ms for 8 GPUs, vs ~250 ms to start nvidia-smi), /proc is read in-process:
 # a sample forks nothing. Python 3.4+ stdlib only. Every non-GPU line is tagged
 # @@x so shell-rc noise can't be mistaken for data.
-import ctypes, os, pwd, sys, threading, time
+import ctypes, os, pwd, select, sys, threading, time
 
 TCK = os.sysconf("SC_CLK_TCK")
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
@@ -176,7 +176,7 @@ def meminfo():
 
 prev_tot, prev_cores = cpu_stat(True)
 t_start = time.monotonic()
-core_t, core_levels = t_start - 1.0, "0" * len(prev_cores)  # the first frame computes the strip too  # per-core strip: refreshed every 0.5 s
+core_t, core_levels = t_start - 1.0, "0" * len(prev_cores)  # strip: at most every 0.2 s; first frame too  # per-core strip: refreshed every 0.5 s
 proc_t, proc_lines = 0.0, []  # GPU processes: refreshed every 1 s (NVML: ~0.4 ms per GPU)
 prev_pid = {}  # GPU process pid -> (cpu ticks, wall time)
 host_lines, host_wanted, host_gap, host_thread = [], 0.0, 0.0, None
@@ -253,7 +253,7 @@ def frame(req):
         w("@@G 0\n")
     else:
         w("@@G 127\n")
-    tot, cores = cpu_stat(now - core_t >= 0.5)
+    tot, cores = cpu_stat(now - core_t >= 0.2)
     if cores is not None:
         lv = []
         for (t, i), (pt, pi) in zip(cores, prev_cores):
@@ -293,12 +293,24 @@ if nv is None and len(sys.argv) > 1:
     sys.stdout.flush()
     os.execvp("sh", ["sh", "-c", sys.argv[1]])
 out = sys.stdout.buffer
+IDLE_EXIT = 60  # rgtop writes at least a "k" every 15 s; silence = the client is gone
+pending = b""
 while True:
-    req = sys.stdin.readline()
-    if not req:
-        break
+    while b"\n" not in pending:
+        # a connection whose close never arrived (proxy, VPN, laptop asleep)
+        # leaves this session open on the server: don't linger in it
+        if not select.select([0], [], [], IDLE_EXIT)[0]:
+            sys.exit(0)
+        chunk = os.read(0, 4096)
+        if not chunk:
+            sys.exit(0)
+        pending += chunk
+    line, pending = pending.split(b"\n", 1)
+    req = line.decode("utf-8", "replace").strip()
+    if req == "k":
+        continue  # keepalive
     try:
-        data = frame(req.strip())
+        data = frame(req)
     except Exception as e:  # never die mid-session: report it inside a frame
         data = "@@B\nagent error: %s: %s\n@@G 1\n@@E\n" % (type(e).__name__, e)
     out.write(data.encode("utf-8", "replace"))  # lone surrogates (odd user names) -> "?"
