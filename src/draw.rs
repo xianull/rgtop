@@ -1178,8 +1178,14 @@ pub fn footer_line(st: &Settings, w: usize, th: &Theme, paused: bool, scroll_txt
     ];
     let mut login_btn = Line::default();
     login_btn.act("L ", th.key, Act::Login).act("login", th.warn_on, Act::Login);
+    let newer = crate::update::NEWER.get().map(|v| {
+        let mut l = Line::default();
+        l.act(&format!("↑ {v}"), th.accent, Act::Help); // the help page says how to update
+        l
+    });
     let right = [
         ("login", login.then_some(login_btn)), // a host wants a password
+        ("update", newer), // never dropped, like login: a notice only wide screens show is no notice
         ("scroll", (!scroll_txt.is_empty()).then(|| line(scroll_txt, th.dim))),
         ("int", Some(interval)),
         ("theme", Some(button(&format!("theme {}", st.theme), "t", Act::Theme, th, None))),
@@ -1265,9 +1271,13 @@ fn help_panel(w: usize, th: &Theme, cfg: &str) -> (Vec<Line>, usize) {
                 .extend(row.chars().enumerate().map(|(i, ch)| Cell { ch, st: th.logo(i * 100 / (lw - 1), ch != '█') }));
             body.push(ln);
         }
-        let v = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let mut tail = Line::default();
+        if let Some(n) = crate::update::NEWER.get() {
+            tail.add(&format!("{n} is out: "), th.accent).add("rgtop --update", th.key).add(" · ", th.dim);
+        }
+        tail.add(&format!("v{}", env!("CARGO_PKG_VERSION")), th.dim);
         let mut ln = Line::default();
-        ln.pad(pad + lw - 1 - v.len()).add(&v, th.dim);
+        ln.pad((pad + lw - 1).saturating_sub(tail.w())).extend(&tail);
         body.push(ln);
     }
     for &(k, d) in HELP {
@@ -1559,6 +1569,13 @@ mod tests {
         assert_eq!(l.cells.iter().map(|c| c.ch).collect::<String>(), "a …");
         assert_eq!(short_cpu("AMD EPYC 9654 96-Core Processor"), "EPYC 9654");
         assert_eq!(short_cpu("Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz"), "Xeon Gold 6338");
+    }
+
+    #[test]
+    fn update_notice_stays_in_a_narrow_bottom_bar() {
+        let _ = crate::update::NEWER.set("v9.9.9".into());
+        let bar = footer_line(&Settings::default(), 60, &Theme::new("dark"), false, "", false);
+        assert!(bar.cells.iter().map(|c| c.ch).collect::<String>().contains("↑ v9.9.9"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | RGT
 
 Or download `rgtop-<arch>-<os>.tar.gz` from [Releases](https://github.com/xianull/rgtop/releases), or build it: `cargo install --git https://github.com/xianull/rgtop`.
 
-Upgrade by running the installer again; uninstall with `rm ~/.local/bin/rgtop` (settings live in `~/.config/rgtop/`).
+Upgrade with `rgtop --update` (it runs the installer over the binary you have); uninstall with `rm ~/.local/bin/rgtop` (settings live in `~/.config/rgtop/`). Once a day rgtop asks github.com which release is the latest (one HEAD request, nothing sent); when there's a newer one the bottom bar shows `↑ v4.4.0` and the help page how to update. `RGTOP_NO_UPDATE_CHECK=1` turns that off.
 
 > Coming from gpustatus: hosts and settings in `~/.config/gpustatus/` are picked up automatically, and `$GPUSTATUS_HOSTS` / `$GPUSTATUS_THEME` still work.
 
@@ -70,6 +70,7 @@ Right after a password login rgtop offers to put your SSH key on that server, ov
 | `RGTOP_HOSTS` | hosts to show when none are given as arguments: SSH aliases, separated by spaces or commas |
 | `RGTOP_THEME` | `auto`, `dark` or `light`: the theme until settings are first saved; after that the saved theme wins (switch it with `t`, or override with `--theme`) |
 | `XDG_CONFIG_HOME` | config location: `$XDG_CONFIG_HOME/rgtop/` (default `~/.config/rgtop/`) |
+| `RGTOP_NO_UPDATE_CHECK` | set to anything: don't check github.com for a newer release |
 | `NO_COLOR` | set to anything: no colours |
 | `COLORTERM` | `truecolor` or `24bit` turns on 24-bit colour (most modern terminals set it); otherwise 256 colours are used |
 | `COLUMNS` | width of `rgtop -1` output when it doesn't go to a terminal (default 80) |
@@ -101,6 +102,7 @@ rgtop -1           # print one snapshot and exit (automatic when stdout isn't a 
 rgtop -n 0.1       # start with a 100 ms refresh interval
 rgtop -n auto      # as fast as each host answers (up to 20 samples/s)
 rgtop --reset      # ignore saved settings
+rgtop --update     # install the latest release
 ```
 
 | Key | Action |

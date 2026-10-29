@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | RGT
 
 也可以从 [Releases](https://github.com/xianull/rgtop/releases) 手动下载 `rgtop-<arch>-<os>.tar.gz`，或者用 Rust 编译：`cargo install --git https://github.com/xianull/rgtop`。
 
-升级就是重新跑一遍安装命令；卸载：`rm ~/.local/bin/rgtop`（设置在 `~/.config/rgtop/`）。
+升级：`rgtop --update`（在现有程序的位置重新跑一遍安装脚本）；卸载：`rm ~/.local/bin/rgtop`（设置在 `~/.config/rgtop/`）。rgtop 每天最多向 github.com 查一次最新版本（一个 HEAD 请求，不发送任何信息）；有新版本时底栏会显示 `↑ v4.4.0`，帮助页写明升级方法。设置 `RGTOP_NO_UPDATE_CHECK=1` 即可关闭。
 
 > 从旧版 gpustatus 升级：`~/.config/gpustatus/` 里的 hosts 和设置会被自动读取，环境变量 `GPUSTATUS_HOSTS` / `GPUSTATUS_THEME` 也仍然有效。
 
@@ -70,6 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/xianull/rgtop/main/install.sh | RGT
 | `RGTOP_HOSTS` | 命令行没给主机时要显示的机器：SSH 别名，空格或逗号分隔 |
 | `RGTOP_THEME` | `auto`、`dark` 或 `light`：第一次保存设置之前用的配色；保存之后以保存的为准（按 `t` 切换，或用 `--theme` 临时指定） |
 | `XDG_CONFIG_HOME` | 配置目录：`$XDG_CONFIG_HOME/rgtop/`（默认 `~/.config/rgtop/`） |
+| `RGTOP_NO_UPDATE_CHECK` | 设成任意值：不向 github.com 查询新版本 |
 | `NO_COLOR` | 设成任意值：不显示颜色 |
 | `COLORTERM` | `truecolor` 或 `24bit` 时使用 24 位真彩色（大多数现代终端会自动设置）；否则用 256 色 |
 | `COLUMNS` | `rgtop -1` 的输出不是终端时（比如重定向到文件）使用的宽度，默认 80 |
@@ -101,6 +102,7 @@ rgtop -1           # 打印一次快照就退出；输出不是终端时自动�
 rgtop -n 0.1       # 以 100ms 刷新间隔启动
 rgtop -n auto      # 每台机器一回数据就立刻再采（最多每秒 20 次）
 rgtop --reset      # 忽略保存的设置
+rgtop --update     # 升级到最新版
 ```
 
 | 按键 | 作用 |

@@ -6,6 +6,7 @@ mod draw;
 mod settings;
 mod term;
 mod theme;
+mod update;
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ struct Args {
     timeout: u64,
     theme: Option<&'static str>,
     reset: bool,
+    update: bool,
 }
 
 fn usage() -> String {
@@ -47,6 +49,7 @@ usage: rgtop [options] [HOST ...]
   -t, --timeout S   SSH connect timeout in seconds (default: 8)
       --theme T     auto | dark | light (default: saved, else $RGTOP_THEME, else auto)
       --reset       start from default settings (overwrites {cfg}/settings.json on exit)
+      --update      install the latest release over this binary (runs install.sh)
   -V, --version     print the version
   -h, --help        print this help
 "
@@ -54,7 +57,8 @@ usage: rgtop [options] [HOST ...]
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { hosts: Vec::new(), once: false, interval: None, timeout: 8, theme: None, reset: false };
+    let mut a =
+        Args { hosts: Vec::new(), once: false, interval: None, timeout: 8, theme: None, reset: false, update: false };
     let mut it = std::env::args().skip(1);
     let mut only_hosts = false;
     while let Some(arg) = it.next() {
@@ -90,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
                     Some(choice(&v, &THEMES).ok_or_else(|| format!("theme must be one of {}", THEMES.join(", ")))?);
             }
             "--reset" => a.reset = true,
+            "--update" => a.update = true,
             "-V" | "--version" => {
                 println!("rgtop {VERSION}");
                 std::process::exit(0);
@@ -196,6 +201,9 @@ fn run() -> i32 {
             return 2;
         }
     };
+    if args.update {
+        return update::update();
+    }
     let hosts = load_hosts(args.hosts);
     if hosts.is_empty() {
         eprintln!(
@@ -228,6 +236,9 @@ fn run() -> i32 {
 
     let tty = std::io::stdout().is_terminal();
     let live = tty && !args.once;
+    if live && env("NO_UPDATE_CHECK").is_none_or(|v| v.is_empty()) {
+        update::check();
+    }
     let auto = if tty { detect_theme() } else { "dark" };
     let th = Theme::new(if st.theme == "auto" { auto } else { st.theme });
     let home = std::env::var("HOME").unwrap_or_default();
