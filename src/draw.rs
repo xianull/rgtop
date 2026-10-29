@@ -454,7 +454,9 @@ fn put_spark(ln: &mut Line, hist: Option<&VecDeque<f32>>, width: usize, th: &The
             continue;
         }
         let ch = char::from_u32(0x2800 | BRAILLE_L[la] | BRAILLE_R[lb]).unwrap_or('?');
-        ln.cells.push(Cell { ch, st: th.level(Some(a.unwrap_or(0.0).max(b.unwrap_or(0.0)))) });
+        // colour by the dots' level, not the exact value: a cell changes only when its
+        // dots do, and neighbours of one level share one colour code
+        ln.cells.push(Cell { ch, st: th.level(Some((la.max(lb) as f64 - 0.5) * 25.0)) });
     }
 }
 
@@ -464,7 +466,10 @@ fn put_strip(ln: &mut Line, vals: impl Iterator<Item = Option<f64>>, th: &Theme)
         let (ch, st) = match v {
             None => ('·', th.dim),
             Some(v) if v < 1.0 => ('▁', th.baseline),
-            Some(v) => (BLOCKS[((v * 8.0 / 100.01) as usize).min(7)], th.level(Some(v))),
+            Some(v) => {
+                let k = ((v * 8.0 / 100.01) as usize).min(7); // colour by block height, as in put_spark
+                (BLOCKS[k], th.level(Some((k as f64 + 0.5) * 12.5)))
+            }
         };
         ln.cells.push(Cell { ch, st });
     }
@@ -813,7 +818,15 @@ fn fold_line(s: &Sample, th: &Theme, ng: usize) -> Line {
 }
 
 /// -> (title left, title right, bottom-right label)
-fn card_title(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, folded: bool) -> (Line, Line, Option<Line>) {
+/// `width`: the card's, so the CPU model is left out rather than cut mid-word.
+fn card_title(
+    cx: &Ctx,
+    tw: &mut Tweener,
+    i: usize,
+    h: &Host,
+    folded: bool,
+    width: usize,
+) -> (Line, Line, Option<Line>) {
     let th = cx.th;
     let a = Act::Fold(i);
     let (mut left, mut right) = (Line::default(), Line::default());
@@ -825,10 +838,6 @@ fn card_title(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, folded: bool) -> (
     if models.len() == 1 {
         left.add(&format!("  {}× {}", s.gpus.len(), models.first().unwrap()), th.dim);
     }
-    if !s.cpu_model.is_empty() {
-        let n = if s.sockets > 1 { format!("{}× ", s.sockets) } else { String::new() };
-        left.add(&format!(" · {n}{}", short_cpu(&s.cpu_model)), th.dim);
-    }
     let age = since(cx.now, h.updated);
     if cx.live && !cx.paused && h.status == Status::Ok && age > cx.stale_after {
         right.add(&format!("stale {}s", D0(age)), th.warn).add(" · ", th.dim);
@@ -838,6 +847,13 @@ fn card_title(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, folded: bool) -> (
         right.add(&idle.to_string(), if idle > 0 { th.state[0] } else { th.dim });
         right.add(&format!("/{} idle", s.gpus.len()), th.dim).add(" · ", th.dim);
         right.add(&format!("{}G", D0(free_gib(&s.gpus))), PLAIN).add(" free", th.dim);
+    }
+    if !s.cpu_model.is_empty() {
+        let n = if s.sockets > 1 { format!("{}× ", s.sockets) } else { String::new() };
+        let cpu = format!(" · {n}{}", short_cpu(&s.cpu_model));
+        if left.w() + str_w(&cpu) + 9 + right.w() <= width {
+            left.add(&cpu, th.dim); // room as top_border counts it
+        }
     }
     let mut bottom = Line::default();
     if let Some(u) = s.uptime {
@@ -1231,10 +1247,10 @@ const HELP: &[(&str, &str)] = &[
     ("Keys", ""),
     ("← →   < >", "sort hosts: host · idle · vram · util"),
     ("r", "reverse sort"),
-    ("−  +", "refresh interval ±100 ms; below 100 ms: auto, as fast as hosts answer"),
+    ("−  +", "refresh ±100 ms; below 100: auto, as fast as hosts answer"),
     ("space   enter", "pause / resume sampling · sample now"),
     ("f", "free only: hide busy GPUs"),
-    ("c o h u p", "toggle CPU rows · per-core strip · util history · GPU user · processes"),
+    ("c o h u p", "toggle: CPU rows · cores · history · GPU users · processes"),
     ("l", "list view: one row per host"),
     ("1-9   a", "fold host N · fold / unfold all"),
     ("↑ ↓ PgUp PgDn", "scroll (also j / k, g / G, mouse wheel)"),
@@ -1243,7 +1259,7 @@ const HELP: &[(&str, &str)] = &[
     ("L", "log in to hosts that want a password; kept until 8 h unused"),
     ("q", "quit            esc  ?   close this help"),
     ("Mouse", ""),
-    ("click", "bottom-bar buttons · host title folds it · list row opens it"),
+    ("click", "bottom bar · card title folds it · list row opens it"),
     ("Colours", ""),
 ];
 
@@ -1287,9 +1303,14 @@ fn help_panel(w: usize, th: &Theme, cfg: &str) -> (Vec<Line>, usize) {
             }
             body.push(line(k, th.title));
         } else {
-            let mut ln = line(&format!("  {}", ljust(k, 15)), th.key);
-            ln.add(d, th.fg);
-            body.push(ln);
+            // too long for the panel: continued under itself, not cut off
+            let room = hw.saturating_sub(4 + 17).max(20);
+            let parts = if str_w(d) <= room { vec![d.to_string()] } else { wrap(d, room) };
+            for (n, part) in parts.iter().enumerate() {
+                let mut ln = line(&format!("  {}", ljust(if n == 0 { k } else { "" }, 15)), th.key);
+                ln.add(part, th.fg);
+                body.push(ln);
+            }
         }
     }
     let mut ln = line("  ● ", th.state[0]);
@@ -1442,7 +1463,7 @@ fn layout_cards(
         .map(|&i| {
             let h = &snaps[i];
             let folded = cx.st.collapsed.contains(&h.name);
-            let (l, r, b) = card_title(cx, tw, i, h, folded);
+            let (l, r, b) = card_title(cx, tw, i, h, folded, card_w);
             (i, frame_card(l, r, card_body(cx, tw, i, h, card_w, folded), card_w, cx.th, b))
         })
         .collect();
@@ -1560,6 +1581,11 @@ mod tests {
                 .any(|l| l.cells.iter().map(|c| c.ch).collect::<String>().contains("██████╗  ██████╗ ████████╗"))
         };
         assert!(has_logo(100) && has_logo(47) && !has_logo(46)); // shown only where it fits whole
+        for w in [80, 120] {
+            let help = help_panel(w, &Theme::new("dark"), "~/.config/rgtop/settings.json").0;
+            assert!(!help.iter().any(|l| l.cells.iter().any(|c| c.ch == '…')), "help cut off at {w} columns");
+        }
+        assert!(HELP.iter().all(|(_, d)| str_w(d) <= 59), "a help line wraps at 80 columns");
         assert_eq!(thousands(std::iter::empty::<f64>().sum()), "0");
         assert_eq!(thousands(1576.6), "1,577");
         assert_eq!(thousands(1234567.0), "1,234,567");
