@@ -151,6 +151,12 @@ impl Theme {
     pub fn dot(&self, state: f64, glow: f64) -> Style {
         Style::fg(mix(self.ramp[idx(Some(state * 50.0))], self.title_rgb, glow)).bold()
     }
+
+    /// One cell of the logo: the meter ramp by column, its shadow faded toward the track.
+    pub fn logo(&self, pct: usize, shadow: bool) -> Style {
+        let c = self.ramp[pct.min(100)];
+        Style::fg(if shadow { mix(c, self.faint, 0.45) } else { c })
+    }
 }
 
 /// Ask the terminal for its background colour (OSC 11). A DA1 query is sent

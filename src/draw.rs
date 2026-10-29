@@ -1241,10 +1241,35 @@ const HELP: &[(&str, &str)] = &[
     ("Colours", ""),
 ];
 
+/// ANSI Shadow, like btop's logo (docs/logo.py draws the same for the README).
+const LOGO: [&str; 6] = [
+    "██████╗  ██████╗ ████████╗ ██████╗ ██████╗ ",
+    "██╔══██╗██╔════╝ ╚══██╔══╝██╔═══██╗██╔══██╗",
+    "██████╔╝██║  ███╗   ██║   ██║   ██║██████╔╝",
+    "██╔══██╗██║   ██║   ██║   ██║   ██║██╔═══╝ ",
+    "██║  ██║╚██████╔╝   ██║   ╚██████╔╝██║     ",
+    "╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝     ",
+];
+
 fn help_panel(w: usize, th: &Theme, cfg: &str) -> (Vec<Line>, usize) {
     debug_assert_eq!(SORTS.join(" · "), "host · idle · vram · util");
     let hw = w.min(84);
     let mut body = Vec::new();
+    let lw = LOGO[0].chars().count();
+    if let Some(pad) = hw.checked_sub(4 + lw).map(|room| room / 2) {
+        // centred, the meter gradient left to right (a bar filling up), version under its right end
+        for row in LOGO {
+            let mut ln = Line::default();
+            ln.pad(pad);
+            ln.cells
+                .extend(row.chars().enumerate().map(|(i, ch)| Cell { ch, st: th.logo(i * 100 / (lw - 1), ch != '█') }));
+            body.push(ln);
+        }
+        let v = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let mut ln = Line::default();
+        ln.pad(pad + lw - 1 - v.len()).add(&v, th.dim);
+        body.push(ln);
+    }
     for &(k, d) in HELP {
         if d.is_empty() {
             if !body.is_empty() {
@@ -1518,6 +1543,13 @@ mod tests {
 
     #[test]
     fn formatting() {
+        let has_logo = |w| {
+            help_panel(w, &Theme::new("dark"), "")
+                .0
+                .iter()
+                .any(|l| l.cells.iter().map(|c| c.ch).collect::<String>().contains("██████╗  ██████╗ ████████╗"))
+        };
+        assert!(has_logo(100) && has_logo(47) && !has_logo(46)); // shown only where it fits whole
         assert_eq!(thousands(std::iter::empty::<f64>().sum()), "0");
         assert_eq!(thousands(1576.6), "1,577");
         assert_eq!(thousands(1234567.0), "1,234,567");

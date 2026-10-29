@@ -1,4 +1,4 @@
-# rgtop
+# <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg"><source media="(prefers-color-scheme: light)" srcset="docs/logo-light.svg"><img alt="rgtop" src="docs/logo-dark.svg" width="430"></picture>
 
 [![Release](https://img.shields.io/github/v/release/xianull/rgtop)](https://github.com/xianull/rgtop/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/xianull/rgtop/release.yml?branch=main&label=CI)](https://github.com/xianull/rgtop/actions/workflows/release.yml)
