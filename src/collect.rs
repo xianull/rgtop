@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::app::Msg;
@@ -597,6 +597,7 @@ pub struct Worker {
     kill_reason: Mutex<Option<String>>,
     pub done: AtomicBool,
     retry_now: AtomicBool,
+    thread: OnceLock<std::thread::Thread>, // the worker's, to unpark it
 }
 
 impl Worker {
@@ -620,6 +621,7 @@ impl Worker {
             kill_reason: Mutex::new(None),
             done: AtomicBool::new(false),
             retry_now: AtomicBool::new(false),
+            thread: OnceLock::new(),
         }
     }
 
@@ -767,12 +769,8 @@ impl Worker {
             let retry = Duration::from_secs_f64(backoff);
             self.host.lock().unwrap().failed(msg, Some(Instant::now() + retry));
             self.notify();
-            let until = Instant::now() + retry;
-            while Instant::now() < until && !self.retry_now.swap(false, SeqCst) {
-                if self.stop.load(SeqCst) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+            if !self.wait_retry(Instant::now() + retry) {
+                return;
             }
             backoff = (backoff * 2.0).min(30.0);
         }
@@ -781,6 +779,23 @@ impl Worker {
     /// Skip the rest of the backoff wait (e.g. right after a login).
     pub fn retry_now(&self) {
         self.retry_now.store(true, SeqCst);
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// Wait for the next attempt: until `until`, or until retry_now(). Parked,
+    /// not polling, so a host that is down costs no wakeups. -> false: stopping.
+    fn wait_retry(&self, until: Instant) -> bool {
+        let _ = self.thread.set(std::thread::current());
+        while !self.retry_now.swap(false, SeqCst) && !self.stop.load(SeqCst) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::park_timeout(left);
+        }
+        !self.stop.load(SeqCst)
     }
 
     pub fn kill(&self, reason: Option<&str>) {
@@ -910,6 +925,21 @@ mod tests {
         let cmd = install_key_command("gpu-1", 8, key);
         assert!(cmd.contains(&format!("ControlPath={}", mux_socket("gpu-1").display())));
         assert!(cmd.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn retry_now_wakes_a_waiting_worker() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let w = Arc::new(Worker::new("h", 8, false, tx, Arc::default(), Arc::default()));
+        let t0 = Instant::now();
+        let waiter = {
+            let w = w.clone();
+            std::thread::spawn(move || w.wait_retry(Instant::now() + Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        w.retry_now();
+        assert!(waiter.join().unwrap()); // woken, not stopping
+        assert!(t0.elapsed() < Duration::from_secs(5)); // long before the 30 s
     }
 
     #[test]

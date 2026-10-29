@@ -276,7 +276,8 @@ fn run() -> i32 {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 // poll, then read: while INPUT_PAUSED (an ssh login owns the
-                // terminal) nothing is read, so the password goes to ssh
+                // terminal) nothing is read, so the password goes to ssh. No
+                // timeout: an idle rgtop shouldn't wake up 10 times a second
                 let mut buf = [0u8; 1024];
                 loop {
                     let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
@@ -284,7 +285,7 @@ fn run() -> i32 {
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
                     }
-                    if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 || INPUT_PAUSED.load(SeqCst) {
+                    if unsafe { libc::poll(&mut pfd, 1, -1) } <= 0 || INPUT_PAUSED.load(SeqCst) {
                         continue;
                     }
                     let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
