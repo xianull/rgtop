@@ -1234,7 +1234,7 @@ const HELP: &[(&str, &str)] = &[
     ("↑ ↓ PgUp PgDn", "scroll (also j / k, g / G, mouse wheel)"),
     ("t", "theme: auto → dark → light"),
     ("m", "mouse capture on / off (off = select text with the mouse)"),
-    ("L", "log in to hosts that want a password (ssh asks; kept 8 h)"),
+    ("L", "log in to hosts that want a password; kept until 8 h unused"),
     ("q", "quit            esc  ?   close this help"),
     ("Mouse", ""),
     ("click", "bottom-bar buttons · host title folds it · list row opens it"),
@@ -1314,7 +1314,14 @@ impl Frame {
     }
 }
 
-fn order_hosts(snaps: &[Host], st: &Settings) -> Vec<usize> {
+/// Hosts in display order. Sorting uses each host's value as last held, which
+/// only follows the live value once that moved by more than a margin (1 GiB, 10%
+/// util): two hosts with near-equal values would otherwise trade places on
+/// every sample. `held` belongs to the sort it was made for.
+fn order_hosts(snaps: &[Host], st: &Settings, held: &mut (&'static str, Vec<Option<f64>>)) -> Vec<usize> {
+    if held.0 != st.sort {
+        *held = (st.sort, Vec::new());
+    }
     let mut idx: Vec<usize> = (0..snaps.len()).collect();
     if st.sort == "host" {
         if st.reverse {
@@ -1324,28 +1331,63 @@ fn order_hosts(snaps: &[Host], st: &Settings) -> Vec<usize> {
     }
     let gpus = |i: usize| snaps[i].sample.as_ref().map(|s| s.gpus.as_slice()).unwrap_or(&[]);
     let (mut have, rest): (Vec<usize>, Vec<usize>) = idx.into_iter().partition(|&i| !gpus(i).is_empty());
-    let key = |i: usize| -> (f64, f64) {
-        let g = gpus(i);
-        match st.sort {
-            "idle" => (-(g.iter().filter(|g| g.state() == 0).count() as f64), -free_gib(g)),
-            "vram" => (-free_gib(g), 0.0),
-            _ => (g.iter().map(|g| g.util.unwrap_or(0.0)).sum::<f64>() / g.len() as f64, 0.0), // least busy first
-        }
+    let (margin, key): (f64, fn(&[Gpu]) -> f64) = match st.sort {
+        // most idle GPUs first, then most free VRAM (≤ 1e6 GiB per host)
+        "idle" => (1.0, |g| -(g.iter().filter(|g| g.state() == 0).count() as f64 * 1e6 + free_gib(g))),
+        "vram" => (1.0, |g| -free_gib(g)),
+        _ => (10.0, |g| g.iter().map(|g| g.util.unwrap_or(0.0)).sum::<f64>() / g.len() as f64), // least busy first
     };
+    held.1.resize(snaps.len(), None);
+    for &i in &have {
+        let k = key(gpus(i));
+        if held.1[i].is_none_or(|h| (k - h).abs() > margin) {
+            held.1[i] = Some(k);
+        }
+    }
+    let val = |i: usize| held.1[i].unwrap_or(0.0);
     // stable either way, like Python's sorted(reverse=True)
     have.sort_by(|&a, &b| {
-        let (ka, kb) = (key(a), key(b));
-        let o = ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1));
+        let o = val(a).total_cmp(&val(b));
         if st.reverse { o.reverse() } else { o }
     });
     have.extend(rest);
     have
 }
 
-/// Card columns. Masonry: each card goes to the currently shortest column, so
-/// a folded or short card never leaves a hole next to a tall one. Too tall for
-/// the screen -> compact: the column-header rows are dropped (each card is
-/// still built only once).
+/// Masonry: a column for each card (heights in rows), each going to the then
+/// shortest column, and the tallest column's height. `keep` (the last frame's
+/// columns) wins unless it is more than SLACK rows taller, or runs past the
+/// screen (`room` rows) where the greedy layout fits: a card that grows by a row
+/// (a process started, an error line) must not send the cards after it hopping
+/// to the other column.
+fn place(heights: &[usize], ncols: usize, keep: Option<&[usize]>, room: Option<usize>) -> (Vec<usize>, usize) {
+    const SLACK: usize = 3;
+    let tallest = |at: &[usize]| {
+        let mut h = vec![0; ncols];
+        at.iter().zip(heights).for_each(|(&c, &n)| h[c] += n);
+        h.into_iter().max().unwrap_or(0)
+    };
+    let mut h = vec![0; ncols];
+    let greedy: Vec<usize> = heights
+        .iter()
+        .map(|&n| {
+            let c = (0..ncols).min_by_key(|&c| h[c]).unwrap_or(0);
+            h[c] += n;
+            c
+        })
+        .collect();
+    let tall = tallest(&greedy);
+    match keep.filter(|k| k.len() == heights.len() && k.iter().all(|&c| c < ncols)).map(|k| (k, tallest(k))) {
+        Some((k, kt)) if kt <= tall + SLACK && room.is_none_or(|r| kt <= r.max(tall)) => (k.to_vec(), kt),
+        _ => (greedy, tall),
+    }
+}
+
+/// Card columns, placed by `place`, so a folded or short card never leaves a
+/// hole next to a tall one. Too tall for the screen -> compact: the
+/// column-header rows are dropped (each card is still built only once).
+/// `placed`: (order, columns, column of each card) of the last frame.
+#[allow(clippy::too_many_arguments)]
 fn layout_cards(
     cx: &Ctx,
     tw: &mut Tweener,
@@ -1354,6 +1396,7 @@ fn layout_cards(
     anchors: &mut [Option<usize>],
     area: Option<usize>,
     w: usize,
+    placed: &mut Option<(Vec<usize>, usize, Vec<usize>)>,
 ) -> Vec<(Vec<Line>, usize)> {
     let n = order.len().max(1);
     let max_cols = (w / CARD_MIN_WIDTH).clamp(1, n);
@@ -1368,30 +1411,21 @@ fn layout_cards(
             (i, frame_card(l, r, card_body(cx, tw, i, h, card_w, folded), card_w, cx.th, b))
         })
         .collect();
-    let height = |lines: &[Line], compact: bool| lines.iter().filter(|l| !(compact && l.optional)).count();
-    let place = |compact: bool| {
-        let mut heights = vec![0; ncols];
-        let spots: Vec<(usize, usize)> = cards
-            .iter()
-            .map(|(_, lines)| {
-                let c = (0..ncols).min_by_key(|&c| heights[c]).unwrap_or(0);
-                let top = heights[c];
-                heights[c] += height(lines, compact);
-                (c, top)
-            })
-            .collect();
-        (spots, heights.into_iter().max().unwrap_or(0))
+    let heights = |compact: bool| -> Vec<usize> {
+        cards.iter().map(|(_, lines)| lines.iter().filter(|l| !(compact && l.optional)).count()).collect()
     };
-    let (mut spots, tall) = place(false);
+    let keep = placed.as_ref().filter(|p| p.0 == order && p.1 == ncols).map(|p| p.2.as_slice());
+    let (mut at, tall) = place(&heights(false), ncols, keep, area);
     let compact = area.is_some_and(|a| tall > a);
     if compact {
-        spots = place(true).0;
+        at = place(&heights(true), ncols, keep, area).0;
     }
     let mut cols: Vec<Vec<Line>> = vec![Vec::new(); ncols];
-    for ((i, lines), (c, top)) in cards.into_iter().zip(spots) {
-        anchors[i] = Some(top);
+    for ((i, lines), &c) in cards.into_iter().zip(&at) {
+        anchors[i] = Some(cols[c].len());
         cols[c].extend(lines.into_iter().filter(|l| !(compact && l.optional)));
     }
+    *placed = Some((order.to_vec(), ncols, at));
     cols.into_iter().map(|c| (c, card_w)).collect()
 }
 
@@ -1401,13 +1435,25 @@ pub struct Renderer {
     cfg: String,
     tw: Tweener,
     t0: Instant,
-    pub animating: bool, // bars easing or a dot glowing -> render at FPS
-    pub spinning: bool,  // a spinner is visible -> render at the spinner rate
+    pub animating: bool,                             // bars easing or a dot glowing -> render at FPS
+    pub spinning: bool,                              // a spinner is visible -> render at the spinner rate
+    held: (&'static str, Vec<Option<f64>>),          // sort values, see order_hosts
+    placed: Option<(Vec<usize>, usize, Vec<usize>)>, // card columns, see layout_cards
 }
 
 impl Renderer {
     pub fn new(th: Theme, live: bool, cfg: String) -> Self {
-        Renderer { th, live, cfg, tw: Tweener::default(), t0: Instant::now(), animating: false, spinning: false }
+        Renderer {
+            th,
+            live,
+            cfg,
+            tw: Tweener::default(),
+            t0: Instant::now(),
+            animating: false,
+            spinning: false,
+            held: ("", Vec::new()),
+            placed: None,
+        }
     }
 
     /// Seconds until the spinner shows its next glyph.
@@ -1442,7 +1488,7 @@ impl Renderer {
             ng: snaps.iter().filter_map(|h| h.sample.as_ref()).map(|s| s.gpus.len()).max().unwrap_or(0),
         };
         let tw = &mut self.tw;
-        let order = order_hosts(snaps, st);
+        let order = order_hosts(snaps, st, &mut self.held);
         let header = header_line(&cx, snaps, w);
         let mut anchors = vec![None; snaps.len()];
 
@@ -1451,7 +1497,7 @@ impl Renderer {
         } else if st.view == "list" {
             vec![(list_panel(&cx, tw, snaps, &order, w), w)]
         } else {
-            layout_cards(&cx, tw, snaps, &order, &mut anchors, area, w)
+            layout_cards(&cx, tw, snaps, &order, &mut anchors, area, w, &mut self.placed)
         };
 
         self.spinning = snaps.iter().any(|h| h.status == Status::Connecting);
@@ -1481,6 +1527,42 @@ mod tests {
         assert_eq!(l.cells.iter().map(|c| c.ch).collect::<String>(), "a …");
         assert_eq!(short_cpu("AMD EPYC 9654 96-Core Processor"), "EPYC 9654");
         assert_eq!(short_cpu("Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz"), "Xeon Gold 6338");
+    }
+
+    #[test]
+    fn cards_and_hosts_stay_put() {
+        let (a, _) = place(&[10, 10, 8], 2, None, None);
+        assert_eq!(a, [0, 1, 0]);
+        assert_eq!(place(&[11, 10, 8], 2, None, None).0, [0, 1, 1]); // alone, the third card would hop
+        assert_eq!(place(&[11, 10, 8], 2, Some(&a), None).0, a);
+        assert_eq!(place(&[30, 10, 8], 2, Some(&a), None).0, [0, 1, 1]); // far out of balance: re-placed
+        assert_eq!(place(&[11, 10, 8], 2, Some(&a), Some(18)).0, [0, 1, 1]); // kept: 19 rows, room for 18
+
+        let host = |u: f64| {
+            let mut h = Host::new("h");
+            let g = Gpu {
+                idx: 0,
+                uuid: String::new(),
+                name: String::new(),
+                util: Some(u),
+                mem_used: 0.0,
+                mem_total: 1.0,
+                temp: None,
+                power: None,
+                power_limit: None,
+                users: Vec::new(),
+            };
+            h.sample = Some(std::sync::Arc::new(Sample { gpus: vec![g], ..Sample::default() }));
+            h
+        };
+        let st = Settings { sort: "util", ..Settings::default() };
+        let mut held = ("", Vec::new());
+        assert_eq!(order_hosts(&[host(50.0), host(45.0)], &st, &mut held), [1, 0]);
+        assert_eq!(order_hosts(&[host(44.0), host(47.0)], &st, &mut held), [1, 0]); // jitter: no swap
+        let by_host = Settings { sort: "host", ..Settings::default() };
+        order_hosts(&[host(44.0), host(47.0)], &by_host, &mut held);
+        assert_eq!(order_hosts(&[host(44.0), host(47.0)], &st, &mut held), [0, 1]); // back from host: sorted afresh
+        assert_eq!(order_hosts(&[host(30.0), host(47.0)], &st, &mut held), [0, 1]); // a real change
     }
 
     /// Worst case: 5 hosts x 8 GPUs, 192 cores, every panel on, data changing

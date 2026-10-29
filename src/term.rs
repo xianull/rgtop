@@ -239,6 +239,30 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// One key, unechoed: y / Y? Ctrl-C is just a key here (no).
+pub fn ask_yes() -> bool {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) != 0 {
+            return false;
+        }
+        let old = t;
+        t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(0, libc::TCSAFLUSH, &t); // keys typed before the question don't answer it
+        let mut b = 0u8;
+        let n = loop {
+            let n = libc::read(0, (&raw mut b).cast(), 1);
+            if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break n;
+            }
+        };
+        libc::tcsetattr(0, libc::TCSANOW, &old);
+        n == 1 && b.eq_ignore_ascii_case(&b'y')
+    }
+}
+
 pub fn size() -> (usize, usize) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -301,8 +325,8 @@ impl Screen {
         }
     }
 
-    /// Diff against the previous frame per cell: only the changed span of each
-    /// row is sent, so an easing bar costs a few cells, not a row. "" = nothing changed.
+    /// Diff against the previous frame per cell: only the changed runs of each
+    /// row are sent, so an easing bar costs a few cells, not a row. "" = nothing changed.
     pub fn diff(&mut self, rows: Vec<Vec<Cell>>, w: usize, h: usize) -> String {
         let mut buf = String::with_capacity(4096);
         let mut cur = PLAIN;
@@ -315,18 +339,17 @@ impl Screen {
         rows.truncate(h);
         for (y, row) in rows.iter().enumerate() {
             let old = self.prev.get(y).filter(|o| o.len() == row.len());
-            let (a, b) = match old {
-                Some(o) => match diff_span(o, row) {
-                    Some(span) => span,
-                    None => continue,
-                },
-                None => (0, row.len()),
+            let runs = match old {
+                Some(o) => diff_runs(o, row),
+                None => vec![(0, row.len())],
             };
-            move_to(&mut buf, y, a);
-            for c in &row[a..b] {
-                if c.ch != WIDE_TAIL {
-                    sgr(&mut buf, &mut cur, c.st, self.cs);
-                    buf.push(c.ch);
+            for (a, b) in runs {
+                move_to(&mut buf, y, a);
+                for c in &row[a..b] {
+                    if c.ch != WIDE_TAIL {
+                        sgr(&mut buf, &mut cur, c.st, self.cs);
+                        buf.push(c.ch);
+                    }
                 }
             }
             if old.is_none() && row.len() < w {
@@ -350,28 +373,144 @@ impl Screen {
     }
 }
 
-/// Changed cells of a row as a half-open range, widened so it never starts on
-/// the right half of a double-width character.
-pub fn diff_span(old: &[Cell], new: &[Cell]) -> Option<(usize, usize)> {
-    let a = old.iter().zip(new).position(|(x, y)| x != y)?;
-    let b = old.iter().zip(new).rposition(|(x, y)| x != y)? + 1;
-    let a = if new[a].ch == WIDE_TAIL || old[a].ch == WIDE_TAIL { a.saturating_sub(1) } else { a };
-    Some((a, b))
+/// Unchanged stretches of at least this many cells between two changes (e.g.
+/// the text between two easing meters) are jumped over with a cursor move,
+/// shorter ones are resent. 3 sends the fewest bytes in bench_frame: resent
+/// cells often carry a colour code.
+const SKIP: usize = 3;
+
+/// Changed cells of a row as half-open runs, each widened so it never starts
+/// on the right half of a double-width character.
+pub fn diff_runs(old: &[Cell], new: &[Cell]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, (x, y)) in old.iter().zip(new).enumerate() {
+        if x == y {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(r) if i - r.1 < SKIP => r.1 = i + 1,
+            _ => {
+                let a = if x.ch == WIDE_TAIL || y.ch == WIDE_TAIL { i.saturating_sub(1) } else { i };
+                runs.push((a, i + 1));
+            }
+        }
+    }
+    runs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthChar;
 
     fn row(s: &str) -> Vec<Cell> {
         s.chars().map(|ch| Cell { ch, st: PLAIN }).collect()
     }
 
     #[test]
-    fn span_covers_only_changes() {
-        assert_eq!(diff_span(&row("abcdef"), &row("abXdeY")), Some((2, 6)));
-        assert_eq!(diff_span(&row("abc"), &row("abc")), None);
-        assert_eq!(diff_span(&row("a中\0b"), &row("a国\0b")), Some((1, 2)));
+    fn runs_cover_only_changes() {
+        assert_eq!(diff_runs(&row("abcdef"), &row("abXdeY")), [(2, 6)]); // short gap: one run
+        assert_eq!(diff_runs(&row("abc"), &row("abc")), []);
+        assert_eq!(diff_runs(&row("a中\0b"), &row("a国\0b")), [(1, 2)]);
+        assert_eq!(diff_runs(&row("a.........b"), &row("X.........Y")), [(0, 1), (10, 11)]); // long gap: skipped
+        let mut tail_only = row("a中\0");
+        tail_only[2].st = Style::fg([9, 9, 9]);
+        assert_eq!(diff_runs(&row("a中\0"), &tail_only), [(1, 3)]); // never start on a wide char's right half
+    }
+
+    /// Replays `diff` output on a minimal terminal (CUP, SGR, ED/EL, text) and
+    /// checks it ends up showing exactly the frame, over frames that change a
+    /// little, a lot, in wide characters and in colour only.
+    #[test]
+    fn diff_replays_to_the_frame() {
+        let (w, h) = (24, 3);
+        let mut grid = vec![vec![BLANK; w]; h];
+        let mut screen = Screen::new(Colors::True);
+        let mut seed = 7u32;
+        let mut rnd = |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let tok = |rnd: &mut dyn FnMut(u32) -> u32| {
+            let st = Style::fg([rnd(2) as u8 * 200, 0, 0]).on([0, rnd(2) as u8 * 90, 0]);
+            (['.', 'x', '中'][rnd(3) as usize], st)
+        };
+        let mut rows: Vec<Vec<(char, Style)>> = vec![Vec::new(); h];
+        for f in 0..2000 {
+            // a few tokens change per frame, sometimes all of them
+            for r in rows.iter_mut() {
+                if f % 50 == 0 {
+                    *r = (0..w).map(|_| tok(&mut rnd)).collect();
+                }
+                for _ in 0..rnd(4) {
+                    let k = rnd(w as u32) as usize;
+                    r[k] = tok(&mut rnd);
+                }
+            }
+            let frame: Vec<Vec<Cell>> = rows
+                .iter()
+                .map(|toks| {
+                    let mut r = Vec::new();
+                    for &(ch, st) in toks {
+                        match ch {
+                            '中' if r.len() + 2 <= w => r.extend([Cell { ch, st }, Cell { ch: WIDE_TAIL, st }]),
+                            '中' => r.push(Cell { ch: '.', st }),
+                            _ => r.push(Cell { ch, st }),
+                        }
+                    }
+                    r.truncate(w);
+                    if r.last().is_some_and(|c| UnicodeWidthChar::width(c.ch) == Some(2)) {
+                        r[w - 1].ch = '.'; // a wide char cut in half at the edge
+                    }
+                    r
+                })
+                .collect();
+            let out = screen.diff(frame.clone(), w, h);
+            let (mut y, mut x, mut st, mut s) = (0, 0, PLAIN, out.as_str());
+            while let Some(c) = s.chars().next() {
+                if c != '\x1b' {
+                    grid[y][x] = Cell { ch: c, st };
+                    if UnicodeWidthChar::width(c) == Some(2) {
+                        grid[y][x + 1] = Cell { ch: WIDE_TAIL, st };
+                        x += 1;
+                    }
+                    x += 1;
+                    s = &s[c.len_utf8()..];
+                    continue;
+                }
+                let end = s.find(|c: char| c.is_ascii_alphabetic()).unwrap();
+                let (params, fin) = (&s[2..end], &s[end..=end]);
+                let n: Vec<u32> = params.split(';').filter_map(|p| p.parse().ok()).collect();
+                match fin {
+                    "H" => (y, x) = (n[0] as usize - 1, n[1] as usize - 1),
+                    "J" => grid.iter_mut().for_each(|r| r.fill(BLANK)),
+                    "m" => {
+                        let mut k = 0;
+                        while k < n.len() {
+                            match n[k] {
+                                0 => st = PLAIN,
+                                1 => st = st.bold(),
+                                38 => {
+                                    (st, k) = (
+                                        Style(
+                                            st.0 & !0x1FF_FFFF
+                                                | Style::fg([n[k + 2], n[k + 3], n[k + 4]].map(|v| v as u8)).0,
+                                        ),
+                                        k + 4,
+                                    )
+                                }
+                                48 => (st, k) = (st.on([n[k + 2], n[k + 3], n[k + 4]].map(|v| v as u8)), k + 4),
+                                _ => panic!("unexpected SGR {}", n[k]),
+                            }
+                            k += 1;
+                        }
+                    }
+                    _ => {} // ?2026h/l, K: no effect on a full-width frame
+                }
+                s = &s[end + 1..];
+            }
+            assert_eq!(grid, frame);
+        }
     }
 
     #[test]

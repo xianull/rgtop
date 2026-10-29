@@ -55,9 +55,15 @@ fn sh_quote(s: &str) -> String {
 
 /// Where `rgtop` keeps a host's login when the host wants a password: an
 /// OpenSSH master connection (ControlMaster) that later sessions ride on.
+/// One-to-one ("a/b" -> "a+2fb"), so two hosts never share a login: a key
+/// installed over it would reach the wrong server.
 pub fn mux_socket(host: &str) -> PathBuf {
-    let safe: String =
-        host.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let safe: String = host
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"._-".contains(&b) { (b as char).to_string() } else { format!("+{b:02x}") }
+        })
+        .collect();
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".ssh").join(format!("rgtop-{safe}"))
 }
 
@@ -75,7 +81,7 @@ pub fn is_auth_error(msg: &str) -> bool {
 }
 
 /// Interactive login: ssh asks for the password itself (rgtop never sees it),
-/// then stays in the background for 8 h as the master connection.
+/// then stays in the background as the master connection: while used, and 8 h after.
 pub fn login_command(host: &str, timeout: u64) -> Vec<String> {
     let mut v: Vec<String> = ["ssh", "-f", "-N"].map(String::from).to_vec();
     for o in [
@@ -83,6 +89,11 @@ pub fn login_command(host: &str, timeout: u64) -> Vec<String> {
         format!("ControlPath={}", mux_socket(host).display()),
         "ControlPersist=8h".into(),
         format!("ConnectTimeout={timeout}"),
+        // the sessions riding on the master send no keepalives of their own: without
+        // these a dead network (sleep, Wi-Fi change) would leave the host stale for
+        // hours. 30 s, not 15 like the sessions: losing this costs a password.
+        "ServerAliveInterval=5".into(),
+        "ServerAliveCountMax=6".into(),
         "ClearAllForwardings=yes".into(),
         "RemoteCommand=none".into(),
         "PermitLocalCommand=no".into(),
@@ -100,6 +111,15 @@ pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
     const LAUNCHER: &str = "python3 -I -S -c 'import ctypes, pwd' >/dev/null 2>&1 && \
                             exec python3 -I -S -c \"$1\" \"$2\"\nexec sh -c \"$2\"\n";
     let remote = format!("sh -c {} rgtop {} {}", sh_quote(LAUNCHER), sh_quote(AGENT_PY), sh_quote(AGENT_SH));
+    let sock = mux_socket(host);
+    // logged in through rgtop: ride on that connection (no password needed)
+    let master = sock.exists().then(|| sock.display().to_string());
+    batch_command(host, timeout, master.as_deref(), &remote)
+}
+
+/// ssh running `remote`, never asking for anything. `master`: a ControlPath
+/// to ride on, or "none" for a connection of its own whatever ~/.ssh/config says.
+pub fn batch_command(host: &str, timeout: u64, master: Option<&str>, remote: &str) -> Vec<String> {
     let mut v: Vec<String> = ["ssh", "-T", "-x", "-a"].map(String::from).to_vec();
     for o in [
         "BatchMode=yes".to_string(),
@@ -115,13 +135,57 @@ pub fn ssh_command(host: &str, timeout: u64) -> Vec<String> {
         v.push("-o".into());
         v.push(o);
     }
-    let sock = mux_socket(host);
-    if sock.exists() {
-        // logged in through rgtop: ride on that connection (no password needed)
-        v.extend(["-o".into(), "ControlMaster=no".into(), "-o".into(), format!("ControlPath={}", sock.display())]);
+    if let Some(p) = master {
+        v.extend(["-o".into(), "ControlMaster=no".into(), "-o".into(), format!("ControlPath={p}")]);
     }
-    v.extend(["--".into(), host.into(), remote]);
+    v.extend(["--".into(), host.into(), remote.into()]);
     v
+}
+
+/// Appends the public key `$1` to ~/.ssh/authorized_keys, like ssh-copy-id.
+/// Already there (commented out, restricted, or a file sshd doesn't read): an
+/// error, never a second copy that would undo an admin's edit.
+const INSTALL_KEY: &str = "umask 077; : \"${HOME:?}\"; d=\"$HOME/.ssh\"; f=\"$d/authorized_keys\"; \
+    mkdir -p \"$d\" && touch \"$f\" || exit 1; k=$(printf '%s\\n' \"$1\" | cut -d' ' -f1,2); \
+    if grep -qF \"$k\" \"$f\"; then echo \"the key is in ~/.ssh/authorized_keys there already, \
+    but not accepted (disabled, restricted, or not the file sshd reads)\" >&2; exit 3; fi; \
+    { [ ! -s \"$f\" ] || [ -z \"$(tail -c1 \"$f\")\" ] || echo; printf '%s\\n' \"$1\"; } >> \"$f\" || exit 1; \
+    command -v restorecon >/dev/null 2>&1 && restorecon -F \"$d\" \"$f\" >/dev/null 2>&1; exit 0";
+
+/// Install `key` (a public key line) on `host` over its login's master connection.
+pub fn install_key_command(host: &str, timeout: u64, key: &str) -> Vec<String> {
+    let remote = format!("sh -c {} rgtop {}", sh_quote(INSTALL_KEY), sh_quote(key));
+    batch_command(host, timeout, Some(&mux_socket(host).display().to_string()), &remote)
+}
+
+/// The first key file ssh tries for `host` (IdentityFile, `ssh -G`) that has a
+/// valid .pub next to it. -> (that .pub, its key line)
+/// ponytail: keys that live only in an agent (no .pub file) aren't offered.
+pub fn public_key(host: &str) -> Option<(PathBuf, String)> {
+    let out = Command::new("ssh").args(["-G", "--", host]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.strip_prefix("identityfile ")).find_map(|f| {
+        let p = PathBuf::from(f.strip_prefix("~/").map_or(f.to_string(), |rest| format!("{home}/{rest}")) + ".pub");
+        if !p.is_absolute() {
+            return None; // "none", relative or unexpanded %-tokens: would read from the current directory
+        }
+        Some((p.clone(), pub_key_line(std::fs::read_to_string(&p).ok()?.lines().next()?)?))
+    })
+}
+
+/// "type base64 [comment]" when `line` is a public key; a comment that isn't
+/// plain text is dropped (the line passes through the remote login shell).
+fn pub_key_line(line: &str) -> Option<String> {
+    let mut w = line.split_whitespace();
+    let (t, b) = (w.next()?, w.next()?);
+    let key = ["ssh-", "ecdsa-", "sk-"].iter().any(|p| t.starts_with(p))
+        && t.bytes().all(|c| c.is_ascii_alphanumeric() || b"-@.".contains(&c))
+        && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c));
+    let comment: Vec<&str> = w.collect();
+    let plain = comment.iter().all(|c| c.bytes().all(|c| c.is_ascii_alphanumeric() || b"@._-".contains(&c)));
+    key.then(
+        || if plain && !comment.is_empty() { format!("{t} {b} {}", comment.join(" ")) } else { format!("{t} {b}") },
+    )
 }
 
 // ── data model ───────────────────────────────────────────────────────────────
@@ -814,11 +878,38 @@ mod tests {
         assert!(is_auth_error("alice@10.0.0.1: Permission denied (publickey,password)."));
         assert!(is_auth_error("Host key verification failed."));
         assert!(!is_auth_error("ssh: connect to host 10.0.0.1 port 22: Operation timed out"));
-        let s = mux_socket("gpu/a b");
-        assert!(s.ends_with(".ssh/rgtop-gpu_a_b"));
+        assert!(mux_socket("gpu/a b").ends_with(".ssh/rgtop-gpu+2fa+20b"));
+        assert!(mux_socket("BUPT_A40_102").ends_with(".ssh/rgtop-BUPT_A40_102")); // usual names unchanged
+        assert_ne!(mux_socket("a/b"), mux_socket("a_b"));
         let cmd = login_command("gpu-1", 8);
         assert!(cmd.contains(&"ControlMaster=yes".to_string()) && !cmd.iter().any(|a| a.contains("BatchMode")));
+        assert!(cmd.contains(&"ServerAliveInterval=5".to_string()));
         assert_eq!(cmd.last().map(String::as_str), Some("gpu-1"));
+    }
+
+    #[test]
+    fn install_key_script() {
+        // a scratch $HOME, never the real one
+        let home = std::env::temp_dir().join(format!("rgtop-key-test-{}", std::process::id()));
+        assert!(home.starts_with(std::env::temp_dir()) && home != std::env::temp_dir());
+        let f = home.join(".ssh").join("authorized_keys");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "ssh-rsa AAAAB3other old@box").unwrap(); // no newline at the end
+        let run = |key: &str| {
+            Command::new("sh").args(["-c", INSTALL_KEY, "rgtop", key]).env("HOME", &home).status().unwrap().success()
+        };
+        let key = "ssh-ed25519 AAAAC3NzaKEY me@laptop";
+        assert!(run(key));
+        assert!(!run("ssh-ed25519 AAAAC3NzaKEY other-comment")); // the same key: an error, no second copy
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("ssh-rsa AAAAB3other old@box\n{key}\n"));
+        assert_eq!(pub_key_line("ssh-ed25519 AAAA+/= me@laptop").as_deref(), Some("ssh-ed25519 AAAA+/= me@laptop"));
+        assert_eq!(pub_key_line("ssh-ed25519 AAAA x'; touch p").as_deref(), Some("ssh-ed25519 AAAA")); // comment dropped
+        assert_eq!(pub_key_line("-----BEGIN OPENSSH PRIVATE KEY-----"), None);
+        assert_eq!(pub_key_line("restrict ssh-ed25519 AAAA"), None);
+        std::fs::remove_dir_all(&home).unwrap();
+        let cmd = install_key_command("gpu-1", 8, key);
+        assert!(cmd.contains(&format!("ControlPath={}", mux_socket("gpu-1").display())));
+        assert!(cmd.contains(&"BatchMode=yes".to_string()));
     }
 
     #[test]

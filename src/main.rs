@@ -125,6 +125,18 @@ fn load_hosts(cli: Vec<String>) -> Vec<String> {
     hosts
 }
 
+/// `Host` aliases in an ssh config (patterns skipped), for the "no hosts" hint.
+fn ssh_aliases(config: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for l in config.lines() {
+        let mut w = l.split(|c: char| c.is_whitespace() || c == '=').filter(|s| !s.is_empty());
+        if w.next().is_some_and(|k| k.eq_ignore_ascii_case("host")) {
+            out.extend(w.take_while(|h| !h.starts_with('#')).filter(|h| !h.contains(['*', '?', '!'])));
+        }
+    }
+    out
+}
+
 fn snaps(workers: &[Arc<Worker>]) -> Vec<collect::Host> {
     workers.iter().map(|w| w.host.lock().unwrap().clone()).collect()
 }
@@ -191,6 +203,11 @@ fn run() -> i32 {
                    or list them in {}",
             config_dir().join("hosts").display()
         );
+        let config = std::fs::read_to_string(format!("{}/.ssh/config", std::env::var("HOME").unwrap_or_default()));
+        let known = ssh_aliases(config.as_deref().unwrap_or(""));
+        if !known.is_empty() {
+            eprintln!("Hosts in ~/.ssh/config: {}", known.join(" "));
+        }
         return 2;
     }
     let path = config_dir().join("settings.json");
@@ -286,4 +303,13 @@ fn run() -> i32 {
 fn main() {
     term::install_panic_hook();
     std::process::exit(run());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ssh_aliases() {
+        let cfg = "Host gpu-1 gpu-2 # lab\n  HostName 10.0.0.1\nhost=bastion\nHost *.lab !x gpu-?\nHostName y\n";
+        assert_eq!(super::ssh_aliases(cfg), ["gpu-1", "gpu-2", "bastion"]);
+    }
 }

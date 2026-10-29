@@ -3,14 +3,15 @@
 
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collect::{
-    DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, login_command, mux_socket, supervise,
+    DATA_GEN, UI_BUSY, WANT_HOST, WANT_PROCS, WANT_SYS, Worker, batch_command, install_key_command, login_command,
+    mux_socket, public_key, supervise,
 };
 use crate::draw::{FPS, Line, Renderer, footer_line};
 use crate::settings::{AUTO, AUTO_TICK_MS, SORTS, Settings, THEMES, VIEWS, step_interval};
@@ -497,10 +498,11 @@ impl App {
         self.screen.leave();
         term::restore();
         for &i in &hosts {
-            let name = &self.names[i];
+            let (name, timeout) = (&self.names[i], self.workers[i].timeout);
             term::write_out(&format!("\nrgtop: {name} needs a login (Ctrl-C skips it)\n"));
-            if run_login(name, self.workers[i].timeout) {
+            if run_login(name, timeout) {
                 self.workers[i].retry_now();
+                offer_key(name, timeout);
             }
         }
         unsafe { libc::tcflush(0, libc::TCIFLUSH) }; // keys ssh didn't read
@@ -658,6 +660,54 @@ fn run_login(host: &str, timeout: u64) -> bool {
         libc::signal(libc::SIGTTOU, old);
     }
     ok
+}
+
+/// Right after a password login: offer to install the user's SSH key over it
+/// (like ssh-copy-id), so the host takes the key from then on and stops asking.
+fn offer_key(host: &str, timeout: u64) {
+    let Some((path, key)) = public_key(host) else { return };
+    let key_works = || run_quiet(&batch_command(host, timeout, Some("none"), "true")).is_ok();
+    if key_works() {
+        return; // the login was for a host key to confirm, not a password
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shown = path.display().to_string();
+    let shown = if !home.is_empty() && shown.starts_with(&home) { shown.replacen(&home, "~", 1) } else { shown };
+    term::write_out(&format!(
+        "rgtop: put your SSH key {shown} on {host}, so it stops asking?\n       \
+         Whoever has its private half can then log in there without the password or code. [y/N] "
+    ));
+    let yes = term::ask_yes();
+    term::write_out(if yes { "y\n" } else { "n\n" });
+    if !yes {
+        return;
+    }
+    term::write_out(&match run_quiet(&install_key_command(host, timeout, &key)) {
+        Err(e) => format!("rgtop: couldn't install the key: {e}\n"),
+        Ok(()) if key_works() => format!("rgtop: key installed, {host} won't ask again\n"),
+        Ok(()) => format!(
+            "rgtop: key installed, but {host} still asks (it may insist on a password or code, \
+             or the key needs ssh-add for its passphrase)\n"
+        ),
+    });
+    std::thread::sleep(Duration::from_millis(1500)); // time to read it before the dashboard is back
+}
+
+/// Run a command with no terminal: Ok, or the last line it printed to stderr.
+fn run_quiet(args: &[String]) -> Result<(), String> {
+    let out = Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let line = err.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+    Err(line.chars().map(|c| if c.is_control() { '?' } else { c }).collect()) // remote text: no escapes
 }
 
 impl Drop for App {
