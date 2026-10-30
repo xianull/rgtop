@@ -12,9 +12,9 @@
 **rgtop** (**r**emote **G**PU **top**) is a btop-style live dashboard for NVIDIA GPUs, CPUs and memory on many remote servers, over plain SSH. One ~700 KB static binary on your machine; nothing to install on the servers.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
-  <img alt="rgtop: four GPU servers, two expanded with CPU rows, GPU rows and processes, two folded" src="docs/screenshot-dark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/demo-dark.gif">
+  <source media="(prefers-color-scheme: light)" srcset="docs/demo-light.gif">
+  <img alt="rgtop live: four GPU servers updating; a folded host is opened, then the one-row-per-host list view" src="docs/demo-dark.gif">
 </picture>
 
 - **GPU rows**: utilization, VRAM, who uses the card (`+N` = N more users, yours highlighted), utilization history, temperature, power. The dot is green when idle (util and VRAM < 5%), yellow when lightly used (< 40%), red when busy, and fades between them.

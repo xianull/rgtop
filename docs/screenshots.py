@@ -1,7 +1,7 @@
-"""Regenerate docs/screenshot-dark.png and docs/screenshot-light.png.
+"""Regenerate the README images: docs/screenshot-{dark,light}.png and docs/demo-{dark,light}.gif.
 
     cargo build --release
-    uv run --with pyte --with pillow --with fonttools docs/screenshots.py
+    uv run --with pyte --with pillow --with fonttools docs/screenshots.py [png|gif]
 
 rgtop runs for real in a pseudo-terminal, but `ssh` on its PATH is this
 script in --fake-ssh mode: a simulated agent with made-up hosts, users and
@@ -10,7 +10,7 @@ and drawn with Pillow; block, box-drawing and braille characters are drawn
 as shapes so they tile without gaps whatever the font.
 """
 
-import json, math, os, random, select, struct, sys, tempfile, time
+import functools, json, math, os, random, select, struct, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -61,7 +61,7 @@ def fake_agent(host):
         dt = max(now - t_prev, 0.05)
         t_prev = now
         prev = stat_line()
-        busy = min(0.95, cfg["load"] + rnd.uniform(-0.03, 0.03))
+        busy = min(0.95, max(0.0, cfg["load"] + rnd.uniform(-0.03, 0.03)))
         jiff[0] += int(cores * 100 * dt)
         idle[0] += int(cores * 100 * dt * (1 - busy))
         w = ["@@B\n", "@@S %s\n" % prev]
@@ -112,7 +112,13 @@ def fake_agent(host):
 
 
 # ── screen capture ────────────────────────────────────────────────────────────
-def capture(binary, theme, cols, rows, secs):
+def snap(screen):
+    return [[screen.buffer[y][x] for x in range(screen.columns)] for y in range(screen.lines)]
+
+
+def capture(binary, theme, cols, rows, secs, keys=(), record_from=None, fps=10):
+    """Run rgtop for secs, typing keys ((time, bytes) pairs). From record_from on, also
+    snapshot the screen fps times a second, never in the middle of a frame."""
     import fcntl, pty, termios
     import pyte
     tmp = tempfile.mkdtemp(prefix="rgtop-shots-")
@@ -132,19 +138,28 @@ def capture(binary, theme, cols, rows, secs):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(PATH=os.path.join(tmp, "bin") + ":" + os.environ["PATH"], XDG_CONFIG_HOME=os.path.join(tmp, "cfg"),
-                          COLORTERM="truecolor", TERM="xterm-256color")
+                          COLORTERM="truecolor", TERM="xterm-256color", RGTOP_NO_UPDATE_CHECK="1")
         os.execv(binary, [binary])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-    end = time.time() + secs
-    while time.time() < end:
-        if select.select([fd], [], [], 0.05)[0]:
+    frames, keys, shot, in_frame, t0 = [], list(keys), record_from, False, time.time()
+    while (t := time.time() - t0) < secs:
+        if keys and t >= keys[0][0]:
+            os.write(fd, keys.pop(0)[1])
+        if shot is not None and t >= shot and not in_frame:
+            frames.append(snap(screen))
+            shot += 1 / fps
+        if select.select([fd], [], [], 0.01)[0]:
             try:
-                stream.feed(os.read(fd, 1 << 16))
+                data = os.read(fd, 1 << 16)
             except OSError:
                 break
+            stream.feed(data)
+            begin, end = data.rfind(b"\x1b[?2026h"), data.rfind(b"\x1b[?2026l")  # synchronized update
+            if begin != end:
+                in_frame = begin > end
     os.write(fd, b"q")
     time.sleep(0.5)
-    return screen
+    return snap(screen), frames
 
 
 # ── rendering ─────────────────────────────────────────────────────────────────
@@ -162,8 +177,12 @@ def rgb(h, default):
         return rgb(default, default)
 
 
-def render(screen, theme, path, size=28):
-    from PIL import Image, ImageDraw, ImageFont
+PAGE_BG = {"dark": (13, 17, 23), "light": (255, 255, 255)}  # github.com, under the GIF's rounded corners
+
+
+@functools.lru_cache
+def load_fonts(size):
+    from PIL import ImageFont
     from fontTools.ttLib import TTFont
     fonts = []
     for p in FONTS:
@@ -174,9 +193,16 @@ def render(screen, theme, path, size=28):
                 fonts.append((bold, ImageFont.truetype(fp, size), set(cmap)))
     if not fonts:
         sys.exit("no usable font found")
+    return fonts
+
+
+def draw(rows, theme, size):
+    from PIL import Image, ImageDraw
+    fonts = load_fonts(size)
+    lines, columns = len(rows), len(rows[0])
     cw, ch = round(fonts[0][1].getlength("M")), round(size * 1.24)
     pad, bar = size, round(size * 1.6)
-    W, H = screen.columns * cw + 2 * pad, screen.lines * ch + 2 * pad + bar
+    W, H = columns * cw + 2 * pad, lines * ch + 2 * pad + bar
     fg0, bg0 = TERM_FG[theme], TERM_BG[theme]
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -196,9 +222,9 @@ def render(screen, theme, path, size=28):
                 return f
         return fonts[0][1]
 
-    for y in range(screen.lines):
-        row = screen.buffer[y]
-        for x in range(screen.columns):
+    for y in range(lines):
+        row = rows[y]
+        for x in range(columns):
             cell = row[x]
             X, Y = pad + x * cw, pad + bar + y * ch
             bg = rgb(cell.bg, bg0)
@@ -242,8 +268,33 @@ def render(screen, theme, path, size=28):
             else:
                 f = glyph_font(c, bool(cell.bold))
                 d.text((X, Y + ch / 2), c, font=f, fill=fg, anchor="lm")
+    return img
+
+
+def render(rows, theme, path, size=28):
+    from PIL import Image
+    img = draw(rows, theme, size)
     img.quantize(256, method=Image.Quantize.FASTOCTREE).save(path, optimize=True)
-    print("wrote", os.path.relpath(path, ROOT), "%dx%d" % (W, H))
+    print("wrote", os.path.relpath(path, ROOT), "%dx%d" % img.size)
+
+
+def render_gif(frames, theme, path, fps, size=16):
+    from PIL import Image
+    imgs = []
+    for rows in frames:
+        img = draw(rows, theme, size)
+        imgs.append(Image.alpha_composite(Image.new("RGBA", img.size, PAGE_BG[theme] + (255,)), img).convert("RGB"))
+    # one palette for every frame and no dithering: unchanged pixels stay identical, so each
+    # GIF frame stores only the rectangle that changed
+    sample = imgs[::max(1, len(imgs) // 8)]
+    strip = Image.new("RGB", (imgs[0].width, imgs[0].height * len(sample)))
+    for k, img in enumerate(sample):
+        strip.paste(img, (0, k * img.height))
+    pal = strip.quantize(256, method=Image.Quantize.FASTOCTREE)
+    ps = [img.quantize(palette=pal, dither=Image.Dither.NONE) for img in imgs]
+    ps[0].save(path, save_all=True, append_images=ps[1:], duration=1000 // fps, loop=0)
+    print("wrote", os.path.relpath(path, ROOT), "%dx%d, %d frames, %.1f MB" % (
+        *imgs[0].size, len(ps), os.path.getsize(path) / 1e6))
 
 
 def main():
@@ -251,9 +302,17 @@ def main():
         fake_agent(sys.argv[2])
         return
     binary = os.path.join(ROOT, "target", "release", "rgtop")
+    what = sys.argv[1:] or ["png", "gif"]
     for theme in ("dark", "light"):
-        screen = capture(binary, theme, cols=120, rows=42, secs=25)
-        render(screen, theme, os.path.join(ROOT, "docs", "screenshot-%s.png" % theme))
+        if "png" in what:
+            rows, _ = capture(binary, theme, cols=120, rows=42, secs=25)
+            render(rows, theme, os.path.join(ROOT, "docs", "screenshot-%s.png" % theme))
+        if "gif" in what:
+            # 15 s to fill the history graphs, then 13 s recorded: unfold gpu-h200-1, list view,
+            # back to where it started so the loop doesn't jump
+            keys = [(19, b"3"), (23, b"l"), (25, b"l"), (25.1, b"3")]
+            _, frames = capture(binary, theme, cols=120, rows=42, secs=28, keys=keys, record_from=15)
+            render_gif(frames, theme, os.path.join(ROOT, "docs", "demo-%s.gif" % theme), fps=10)
 
 
 if __name__ == "__main__":

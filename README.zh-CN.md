@@ -12,9 +12,9 @@
 **rgtop**（**r**emote **G**PU **top**，远程 GPU 版 top）是 btop 风格的多机 GPU / CPU / 内存实时看板。在本地运行，通过 SSH 连接各台服务器，键盘和鼠标都能操作。本地只有一个约 700 KB 的静态二进制，服务器上什么都不用装。
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
-  <img alt="rgtop：4 台 GPU 服务器，两台展开显示 CPU、GPU 和进程，两台折叠" src="docs/screenshot-dark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/demo-dark.gif">
+  <source media="(prefers-color-scheme: light)" srcset="docs/demo-light.gif">
+  <img alt="rgtop 实时刷新：4 台 GPU 服务器，展开一台折叠的主机，再切到每台一行的列表视图" src="docs/demo-dark.gif">
 </picture>
 
 - **GPU 行**：利用率、显存、谁在用这张卡（`+N` 表示还有 N 个用户，你自己会高亮）、利用率历史、温度、功耗。圆点绿色是空闲（利用率和显存都 < 5%），黄色是轻度占用（都 < 40%），红色是繁忙；状态变化时颜色会渐变过去。
