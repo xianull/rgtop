@@ -153,3 +153,7 @@ git tag v4.1.1 && git push --tags                           # CI 编译 4 个平
 ## License
 
 MIT
+
+## 友链
+
+- [LINUX DO](https://linux.do) —— 真正的技术社区
