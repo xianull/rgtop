@@ -31,7 +31,7 @@ pub static UI_BUSY: AtomicBool = AtomicBool::new(false);
 pub const HISTORY: usize = 240; // history points kept per GPU / CPU for the sparklines
 // one history point per sample, but samples closer than this share one (max), so
 // at 100 ms / auto a sparkline still spans a minute rather than seconds
-const BUCKET: Duration = Duration::from_millis(240);
+pub const BUCKET: Duration = Duration::from_millis(240);
 const IDLE_PCT: f64 = 5.0; // util AND mem below this -> idle  (green)
 const LIGHT_PCT: f64 = 40.0; // util AND mem below this -> light (yellow), otherwise busy (red)
 pub const UNKNOWN: &str = "?"; // owner of a GPU process whose PID isn't visible on the host

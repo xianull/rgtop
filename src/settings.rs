@@ -28,6 +28,7 @@ pub struct Settings {
     pub theme: &'static str,
     pub mouse: bool,
     pub collapsed: Vec<String>,
+    pub procs_open: Vec<String>, // hosts listing every process; this session only, not saved
 }
 
 impl Default for Settings {
@@ -46,6 +47,7 @@ impl Default for Settings {
             theme: "auto",
             mouse: true,
             collapsed: Vec::new(),
+            procs_open: Vec::new(),
         }
     }
 }

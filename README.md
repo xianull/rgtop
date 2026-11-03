@@ -19,7 +19,7 @@
 
 - **GPU rows**: utilization, VRAM, who uses the card (`+N` = N more users, yours highlighted), utilization history, temperature, power. The dot is green when idle (util and VRAM < 5%), yellow when lightly used (< 40%), red when busy, and fades between them.
 - **CPU rows**: total CPU, RAM (used, then page cache in a muted tone), 1-minute load, CPU history and package temperature on the GPU columns; below them (toggle with `o`) one cell per core (busiest core per cell when there are more cores than room), the 1 / 5 / 15 min load and swap.
-- **Process list** (`p`): the processes on each GPU with their current %CPU (100 = one core) and host RSS, plus the users keeping the host's CPUs busy right now.
+- **Process list** (`p`): the processes on each GPU with their current %CPU (100 = one core) and host RSS, plus the users keeping the host's CPUs busy right now. The top 8 by VRAM are shown; click `▸ N more` for all of them, `▾ show fewer` to go back.
 - Title: GPU and CPU models. Bottom edge: uptime and the request round trip.
 
 ## Install
@@ -108,7 +108,7 @@ rgtop --update     # install the latest release
 | Key | Action |
 | --- | --- |
 | `−` / `+` | refresh interval ±100 ms, applies instantly; below 100 ms is `auto`: every host is asked again as soon as it answered (up to 20/s) |
-| `←` / `→` | sort hosts: `host` (config order), `idle`, `vram` (most free first), `util` (least busy first) |
+| `←` / `→` | sort hosts: `host` (config order), `idle`, `vram` (most free first), `util` (least busy over the last ~30 s first) |
 | `r` | reverse the sort |
 | `f` | free only: hide busy GPUs |
 | `c` `o` `h` `u` `p` | toggle CPU rows, per-core strip, utilization history, USER column, process list |

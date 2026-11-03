@@ -9,7 +9,7 @@ use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::Act;
-use crate::collect::{Gpu, HISTORY, Host, Proc, Sample, Status, UNKNOWN};
+use crate::collect::{BUCKET, Gpu, HISTORY, Host, Proc, Sample, Status, UNKNOWN};
 use crate::settings::{AUTO, AUTO_TICK_MS, SORTS, Settings, fmt_interval};
 use crate::term::{BLANK, Cell, PLAIN, Style, WIDE_TAIL};
 use crate::theme::Theme;
@@ -19,6 +19,7 @@ const TWEEN_TAU: f64 = 0.07; // seconds; easing time constant: settled ~0.3 s af
 const PULSE_SECS: f64 = 0.5; // status dot glows after each fresh sample (intervals of 1 s and up)
 const CARD_MIN_WIDTH: usize = 80; // narrower terminals get fewer card columns
 const PROC_MAX: usize = 8; // process rows per host card
+const UTIL_SORT_SECS: f64 = 30.0; // the util sort ranks hosts by their mean over this long
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
@@ -722,7 +723,9 @@ fn fmt_vram(mem: f64) -> String {
     if mem != 0.0 { format!("{:>5}G", D1(mem / 1024.0)) } else { "     -".into() }
 }
 
-fn proc_section(s: &Sample, cw: usize, th: &Theme) -> Vec<Line> {
+/// `open`: every process of host `i`, not just the top PROC_MAX.
+/// `click`: the mouse can toggle that (live, mouse capture on).
+fn proc_section(s: &Sample, cw: usize, th: &Theme, i: usize, open: bool, click: bool) -> Vec<Line> {
     let mut rule = Line::default();
     rule.fill(cw, '─', th.border);
     let mut out = vec![rule];
@@ -734,8 +737,8 @@ fn proc_section(s: &Sample, cw: usize, th: &Theme) -> Vec<Line> {
         out.push(line("no GPU processes", th.dim));
         return out;
     };
-    let mut shown: Vec<&Proc> = procs.iter().take(PROC_MAX).collect();
-    if last.pid == 0 && procs.len() > PROC_MAX {
+    let mut shown: Vec<&Proc> = procs.iter().take(if open { procs.len() } else { PROC_MAX }).collect();
+    if !open && last.pid == 0 && procs.len() > PROC_MAX {
         shown.pop(); // keep the hidden-process summary visible
         shown.push(last);
     }
@@ -779,15 +782,38 @@ fn proc_section(s: &Sample, cw: usize, th: &Theme) -> Vec<Line> {
         }
         out.push(ln);
     }
-    if procs.len() > shown.len() {
+    if procs.len() > PROC_MAX && !click {
         out.push(line(&format!("… {} more, sorted by VRAM", procs.len() - shown.len()), th.dim));
+    } else if procs.len() > PROC_MAX {
+        // the whole row toggles this host between the top PROC_MAX and every process
+        let mut ln = Line::default();
+        if open {
+            ln.add("▾ ", th.key).add("show fewer", th.fg);
+        } else {
+            ln.add("▸ ", th.key).add(&format!("{} more", procs.len() - shown.len()), th.fg);
+            ln.add(" · sorted by VRAM · click to show all", th.dim);
+        }
+        ln.zones = vec![(0, cw, Act::Procs(i))];
+        out.push(ln);
     }
     if !s.host_users.is_empty() {
         // who is busy on the CPUs right now, GPU jobs or not (100% = one core)
         let mut ln = line("cpu users  ", th.dim);
+        let n = s.host_users.len();
         for (k, (u, c, rss)) in s.host_users.iter().enumerate() {
+            let stat = format!(" {}% {}", D0(*c), fmt_kb(*rss));
+            // whole entries only, with room left for the " · +N" of the rest
+            let rest = n - k - 1;
+            let tail = if rest > 0 { 4 + rest.to_string().len() } else { 0 };
+            if k > 0 && ln.w() + 3 + str_w(u) + stat.len() + tail > cw {
+                let more = format!(" · +{}", n - k);
+                if ln.w() + str_w(&more) <= cw {
+                    ln.add(&more, th.dim); // no room after a long first entry: left out, not cut
+                }
+                break;
+            }
             ln.add(if k > 0 { " · " } else { "" }, th.dim).add(u, if *u == s.me { th.me } else { th.fg });
-            ln.add(&format!(" {}% {}", D0(*c), fmt_kb(*rss)), th.dim);
+            ln.add(&stat, th.dim);
         }
         out.push(ln);
     }
@@ -954,7 +980,7 @@ fn card_body(cx: &Ctx, tw: &mut Tweener, i: usize, h: &Host, width: usize, folde
         body.push(line(&format!("all {} GPUs busy", s.gpus.len()), th.dim));
     }
     if st.show_proc && !s.gpus.is_empty() {
-        body.extend(proc_section(s, cw, th));
+        body.extend(proc_section(s, cw, th, i, st.procs_open.contains(&h.name), cx.live && st.mouse));
     }
     if let Some(e) = &s.gpu_error {
         body.push(line(&format!("! {e}"), th.warn));
@@ -1260,6 +1286,7 @@ const HELP: &[(&str, &str)] = &[
     ("q", "quit            esc  ?   close this help"),
     ("Mouse", ""),
     ("click", "bottom bar · card title folds it · list row opens it"),
+    ("", "▸ N more under the processes: show all of them"),
     ("Colours", ""),
 ];
 
@@ -1370,6 +1397,23 @@ impl Frame {
     }
 }
 
+/// Mean GPU util of a host over about the last UTIL_SORT_SECS of its history:
+/// training jobs swing a card 0 ↔ 100% between steps, and one card's swing
+/// moves an 8-GPU host's mean by 12.5, so the live value would reorder hosts
+/// all the time. A card with no history yet counts with its live util.
+fn util_sorted_by(h: &Host, gpus: &[Gpu], interval_ms: u64) -> f64 {
+    let per_point = (interval_ms as f64 / 1000.0).max(BUCKET.as_secs_f64());
+    let pts = (UTIL_SORT_SECS / per_point).ceil() as usize;
+    let one = |g: &Gpu| match h.history.gpu.get(&g.idx).filter(|q| !q.is_empty()) {
+        Some(q) => {
+            let k = q.len().min(pts);
+            q.iter().rev().take(k).map(|&v| v as f64).sum::<f64>() / k as f64
+        }
+        None => g.util.unwrap_or(0.0),
+    };
+    gpus.iter().map(one).sum::<f64>() / gpus.len() as f64
+}
+
 /// Hosts in display order. Sorting uses each host's value as last held, which
 /// only follows the live value once that moved by more than a margin (1 GiB, 10%
 /// util): two hosts with near-equal values would otherwise trade places on
@@ -1387,15 +1431,16 @@ fn order_hosts(snaps: &[Host], st: &Settings, held: &mut (&'static str, Vec<Opti
     }
     let gpus = |i: usize| snaps[i].sample.as_ref().map(|s| s.gpus.as_slice()).unwrap_or(&[]);
     let (mut have, rest): (Vec<usize>, Vec<usize>) = idx.into_iter().partition(|&i| !gpus(i).is_empty());
-    let (margin, key): (f64, fn(&[Gpu]) -> f64) = match st.sort {
-        // most idle GPUs first, then most free VRAM (≤ 1e6 GiB per host)
-        "idle" => (1.0, |g| -(g.iter().filter(|g| g.state() == 0).count() as f64 * 1e6 + free_gib(g))),
-        "vram" => (1.0, |g| -free_gib(g)),
-        _ => (10.0, |g| g.iter().map(|g| g.util.unwrap_or(0.0)).sum::<f64>() / g.len() as f64), // least busy first
-    };
+    let margin = if st.sort == "util" { 10.0 } else { 1.0 };
     held.1.resize(snaps.len(), None);
     for &i in &have {
-        let k = key(gpus(i));
+        let g = gpus(i);
+        let k = match st.sort {
+            // most idle GPUs first, then most free VRAM (≤ 1e6 GiB per host)
+            "idle" => -(g.iter().filter(|g| g.state() == 0).count() as f64 * 1e6 + free_gib(g)),
+            "vram" => -free_gib(g),
+            _ => util_sorted_by(&snaps[i], g, st.interval_ms), // least busy first
+        };
         if held.1[i].is_none_or(|h| (k - h).abs() > margin) {
             held.1[i] = Some(k);
         }
@@ -1598,6 +1643,42 @@ mod tests {
     }
 
     #[test]
+    fn process_list_opens_and_cpu_users_fit() {
+        let p = |pid| Proc {
+            pid,
+            user: "u".into(),
+            etime: None,
+            cmd: "python".into(),
+            gpus: vec![0],
+            mem: 1024.0,
+            cpu: None,
+            rss_kb: None,
+        };
+        let users = (0..9).map(|k| (format!("user{k}"), 850.0, 18 << 20)).collect();
+        let s = Sample { procs: Some((1..=12).map(p).collect()), host_users: users, ..Sample::default() };
+        let th = Theme::new("dark");
+        let text = |l: &Line| l.cells.iter().map(|c| c.ch).collect::<String>();
+        let toggle = |ls: &[Line]| ls.iter().find(|l| l.zones.iter().any(|z| z.2 == Act::Procs(3))).map(text);
+
+        let shut = proc_section(&s, 60, &th, 3, false, true);
+        assert_eq!(shut.len(), 1 + 1 + PROC_MAX + 2); // rule, header, rows, toggle, cpu users
+        assert!(toggle(&shut).unwrap().starts_with("▸ 4 more"));
+        let open = proc_section(&s, 60, &th, 3, true, true);
+        assert_eq!(open.len(), 1 + 1 + 12 + 2);
+        assert!(toggle(&open).unwrap().starts_with("▾ show fewer"));
+        let still = proc_section(&s, 60, &th, 3, false, false); // rgtop -1, or mouse off: nothing to click
+        assert!(toggle(&still).is_none() && text(&still[PROC_MAX + 2]).starts_with("… 4 more, sorted by VRAM"));
+
+        // whole "user 850% 18.0G" entries, then "+N" for the rest: never cut mid-number
+        let cpu = text(shut.last().unwrap());
+        assert_eq!(cpu, "cpu users  user0 850% 18.0G · user1 850% 18.0G · +7");
+        let narrow = text(proc_section(&s, 30, &th, 3, false, true).last().unwrap());
+        assert_eq!(narrow.trim_end(), "cpu users  user0 850% 18.0G"); // no room for "+8": left out
+        let few = Sample { procs: Some((1..=3).map(p).collect()), ..Sample::default() };
+        assert!(toggle(&proc_section(&few, 60, &th, 3, false, true)).is_none()); // nothing hidden: no toggle
+    }
+
+    #[test]
     fn update_notice_stays_in_a_narrow_bottom_bar() {
         let _ = crate::update::NEWER.set("v9.9.9".into());
         let bar = footer_line(&Settings::default(), 60, &Theme::new("dark"), false, "", false);
@@ -1638,6 +1719,21 @@ mod tests {
         order_hosts(&[host(44.0), host(47.0)], &by_host, &mut held);
         assert_eq!(order_hosts(&[host(44.0), host(47.0)], &st, &mut held), [0, 1]); // back from host: sorted afresh
         assert_eq!(order_hosts(&[host(30.0), host(47.0)], &st, &mut held), [0, 1]); // a real change
+
+        // util ranks by the mean of about the last 30 s (60 points at 500 ms), not the live value
+        let with_hist = |live: f64, hist: Vec<f32>| {
+            let mut h = host(live);
+            std::sync::Arc::make_mut(&mut h.history).gpu.insert(0, hist.into());
+            h
+        };
+        let st = Settings { sort: "util", interval_ms: 500, ..Settings::default() };
+        let swings: Vec<f32> = (0..60).map(|k| if k % 2 == 0 { 0.0 } else { 100.0 }).collect(); // mean 50
+        for live in [0.0, 100.0] {
+            let mut held = ("", Vec::new());
+            assert_eq!(order_hosts(&[host(60.0), with_hist(live, swings.clone())], &st, &mut held), [1, 0]);
+        }
+        let freed = [vec![100.0; 180], vec![0.0; 60]].concat(); // busy until 30 s ago: mean 0, not 75
+        assert_eq!(order_hosts(&[host(10.0), with_hist(0.0, freed)], &st, &mut ("", Vec::new())), [1, 0]);
     }
 
     /// Worst case: 5 hosts x 8 GPUs, 192 cores, every panel on, data changing

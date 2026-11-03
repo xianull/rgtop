@@ -56,6 +56,7 @@ pub enum Act {
     Fold(usize),  // host index
     FoldN(usize), // N-th host on screen
     Goto(usize),  // host index
+    Procs(usize), // host index: all processes / the top few
     Scroll(isize),
     Page(isize),
 }
@@ -350,6 +351,13 @@ impl App {
             Act::FoldN(k) => {
                 if let Some(&i) = self.order.get(k) {
                     self.toggle_fold(&self.names[i].clone());
+                }
+            }
+            Act::Procs(i) => {
+                let name = &self.names[i];
+                match st.procs_open.iter().position(|c| c == name) {
+                    Some(k) => drop(st.procs_open.remove(k)),
+                    None => st.procs_open.push(name.clone()),
                 }
             }
             Act::Goto(i) => {
