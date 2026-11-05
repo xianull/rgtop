@@ -254,6 +254,12 @@ pub struct Sample {
     pub procs: Option<Vec<Proc>>,            // None = processes weren't requested
     pub host_users: Vec<(String, f64, u64)>, // top CPU users of the host: (user, %CPU, RSS kB)
     pub me: String,                          // remote login user
+    /// The server's `collected_at_epoch` for an HTTP frame: how old the data
+    /// itself is, as opposed to when we received it. Sampling every 30 s while
+    /// the UI refreshes every 2 s makes this the difference between "now" and
+    /// "26 s ago", so it is shown in the card footer. None for SSH, where the
+    /// answer is the round trip.
+    pub data_age: Option<f64>,
 }
 
 fn num(s: &str) -> Option<f64> {
@@ -587,6 +593,8 @@ struct Io {
 /// still in flight.
 pub struct Worker {
     pub host: Arc<Mutex<Host>>,
+    /// `http://...` endpoint for the HTTP backend, `None` for SSH hosts.
+    url: Option<String>,
     pub timeout: u64,
     once: bool,
     tx: Sender<Msg>,
@@ -609,8 +617,19 @@ impl Worker {
         stop: Arc<AtomicBool>,
         want: Arc<AtomicU8>,
     ) -> Self {
+        // An http(s) URL is a backend, not a host name: keep the URL in the
+        // worker and show only the node name in the UI (the title column is
+        // 24 chars wide, a full URL would be unreadable there).
+        let (url, label) = match crate::http::parse_url(name) {
+            Some(u) => {
+                let node = crate::http::node_of(&u, name);
+                (Some(name.to_string()), node)
+            }
+            None => (None, name.to_string()),
+        };
         Worker {
-            host: Arc::new(Mutex::new(Host::new(name))),
+            host: Arc::new(Mutex::new(Host::new(&label))),
+            url,
             timeout,
             once,
             tx,
@@ -633,6 +652,15 @@ impl Worker {
     }
 
     pub fn request(&self) -> bool {
+        // HTTP backend: a request is just "fetch now" — hand it to the worker.
+        if self.url.is_some() {
+            self.retry_now.store(true, SeqCst);
+            if let Some(t) = self.thread.get() {
+                t.unpark();
+            }
+            return true;
+        }
+
         let mut io = self.io.lock().unwrap();
         if io.sent.is_some() {
             return false;
@@ -655,6 +683,10 @@ impl Worker {
 
     /// A no-op line for the agent if we haven't written for KEEPALIVE.
     pub fn keepalive(&self) {
+        // HTTP has no session to keep alive.
+        if self.url.is_some() {
+            return;
+        }
         let mut io = self.io.lock().unwrap();
         if io.wrote.elapsed() >= KEEPALIVE {
             if let Some(stdin) = io.stdin.as_mut() {
@@ -665,9 +697,70 @@ impl Worker {
     }
 
     pub fn run(&self) {
-        self.session_loop();
+        if self.url.is_some() {
+            self.http_loop();
+        } else {
+            self.session_loop();
+        }
         self.done.store(true, SeqCst);
         self.notify();
+    }
+
+    /// HTTP backend: poll the API instead of holding an SSH session open.
+    ///
+    /// Unlike SSH there is nothing to keep alive and nothing to write: a request
+    /// is simply "fetch now". `retry_now` doubles as that trigger, so the UI
+    /// scheduler drives this backend through the same `request()` call.
+    fn http_loop(&self) {
+        let Some(raw) = self.url.clone() else { return };
+        let Some(u) = crate::http::parse_url(&raw) else { return };
+        let node = crate::http::node_of(&u, &raw);
+        drop(u);
+
+        // After a failure the next attempt waits `backoff`, even though the
+        // scheduler keeps calling request(): a dead server must not be polled
+        // every tick. A success resets it to zero.
+        let mut backoff: f64 = 0.0;
+        let mut next_try = Instant::now();
+
+        loop {
+            if self.stop.load(SeqCst) {
+                return;
+            }
+            if !self.once {
+                // Sleep until the scheduler asks again, but never before
+                // `next_try`; wake on stop or on an explicit retry_now().
+                while !self.stop.load(SeqCst) && Instant::now() < next_try {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if self.stop.load(SeqCst) {
+                    return;
+                }
+                if !self.retry_now.swap(false, SeqCst) && Instant::now() < next_try {
+                    continue;
+                }
+            }
+            self.retry_now.store(false, SeqCst);
+
+            let want_procs = self.want.load(SeqCst) != WANT_SYS;
+            match crate::http::fetch(&raw, &node, want_procs, self.timeout) {
+                Ok((sample, latency)) => {
+                    self.host.lock().unwrap().push(sample, Some(latency));
+                    self.notify();
+                    backoff = 0.0;
+                    next_try = Instant::now();
+                }
+                Err(e) => {
+                    backoff = if backoff == 0.0 { 2.0 } else { (backoff * 2.0).min(30.0) };
+                    next_try = Instant::now() + Duration::from_secs_f64(backoff);
+                    self.host.lock().unwrap().failed(e, Some(next_try));
+                    self.notify();
+                }
+            }
+            if self.once {
+                return;
+            }
+        }
     }
 
     fn session_loop(&self) {

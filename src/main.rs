@@ -1,8 +1,9 @@
-//! rgtop: btop-style live GPU/CPU dashboard for remote servers over SSH.
+//! rgtop: btop-style live GPU/CPU dashboard for remote servers over SSH or HTTP.
 
 mod app;
 mod collect;
 mod draw;
+mod http;
 mod settings;
 mod term;
 mod theme;
@@ -36,22 +37,27 @@ fn usage() -> String {
     let cfg = config_dir().display().to_string();
     format!(
         "\
-rgtop {VERSION}: btop-style live GPU/CPU dashboard for remote servers over SSH.
+rgtop {VERSION}: btop-style live GPU/CPU dashboard for remote servers over SSH or HTTP.
 Press ? inside the dashboard for keys.
 
 usage: rgtop [options] [HOST ...]
 
-  HOST              ssh host aliases (default: $RGTOP_HOSTS, else {cfg}/hosts)
+  HOST              ssh host alias, or an http:// URL of a monitoring API
+                    (default: $RGTOP_HOSTS, else {cfg}/hosts)
   -1, --once        print one snapshot and exit (implied when stdout is not a terminal)
   -n, --interval S  refresh interval in seconds, from 0.1, or auto (as fast as hosts answer);
                     -/+ adjust it live by 100 ms
                     (default: saved, else 2)
-  -t, --timeout S   SSH connect timeout in seconds (default: 8)
+  -t, --timeout S   connect timeout in seconds (default: 8)
       --theme T     auto | dark | light (default: saved, else $RGTOP_THEME, else auto)
       --reset       start from default settings (overwrites {cfg}/settings.json on exit)
       --update      install the latest release over this binary (runs install.sh)
   -V, --version     print the version
   -h, --help        print this help
+
+An http:// HOST is a JSON endpoint, not a machine to log into. Examples:
+  rgtop http://10.0.0.5:8000/api/rgtop/frame/h100-3
+  rgtop http://10.0.0.5:8000/api/rgtop/frame/h100-3 http://10.0.0.5:8000/api/rgtop/frame/h200-1
 "
     )
 }
