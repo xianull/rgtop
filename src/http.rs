@@ -124,6 +124,74 @@ pub fn fetch(url: &str, node: &str, want_procs: bool, timeout: u64) -> Result<(S
     Ok((sample, elapsed))
 }
 
+/// A batch entry names no node: `http://h:p`, `http://h:p/`, or a path that ends
+/// at `/frame` (`.../api/rgtop/frame`). Such an entry lists every node it serves.
+pub fn is_batch(s: &str) -> bool {
+    let Some(u) = parse_url(s) else { return false };
+    if u.path.trim_end_matches('/').is_empty() {
+        return true;
+    }
+    match u.path.split_once("/frame") {
+        Some((_, rest)) => rest.trim_matches('/').is_empty(),
+        None => false,
+    }
+}
+
+/// `(origin, frame path)` for a batch entry, e.g.
+/// `("http://h:8000", "api/rgtop/frame")`. The frame path keeps any prefix
+/// the server is mounted under.
+fn batch_parts(s: &str) -> Option<(String, String)> {
+    let u = parse_url(s)?;
+    let frame = match u.path.split_once("/frame") {
+        Some((pre, _)) => format!("{}/frame", pre.trim_matches('/')).trim_start_matches('/').to_string(),
+        None => "api/rgtop/frame".to_string(),
+    };
+    Some((format!("{}://{}:{}", u.scheme, u.host, u.port), frame))
+}
+
+/// Node names in a batch frame (`data.nodes[].node`). A name that could be
+/// unsafe in a URL path is skipped rather than requested.
+fn parse_node_names(body: &str) -> Result<Vec<String>, String> {
+    let root: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad JSON: {e}"))?;
+    let nodes = root
+        .get("data")
+        .and_then(|d| d.get("nodes"))
+        .and_then(|v| v.as_array())
+        .ok_or("response has no data.nodes list")?;
+    Ok(nodes
+        .iter()
+        .filter_map(|n| n.get("node").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)))
+        .map(String::from)
+        .collect())
+}
+
+/// Expand every batch entry into one `.../frame/<node>` entry per node the
+/// server lists. Other entries pass through unchanged, and duplicates are
+/// dropped. Fails when a batch endpoint can't be listed, so the user sees why
+/// instead of a silently short list.
+pub fn expand(hosts: Vec<String>, timeout: u64) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for h in hosts {
+        if !is_batch(&h) {
+            out.push(h);
+            continue;
+        }
+        let (origin, frame) = batch_parts(&h).ok_or_else(|| format!("not a valid URL: {h}"))?;
+        let u = parse_url(&origin).ok_or_else(|| format!("not a valid URL: {h}"))?;
+        let body = get(&u, &format!("/{frame}?procs=0"), timeout)
+            .map_err(|e| format!("cannot list nodes from {h}: {e}"))?;
+        let names = parse_node_names(&body).map_err(|e| format!("cannot list nodes from {h}: {e}"))?;
+        if names.is_empty() {
+            return Err(format!("{h} lists no nodes"));
+        }
+        out.extend(names.into_iter().map(|n| format!("{origin}/{frame}/{n}")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|h| seen.insert(h.clone()));
+    Ok(out)
+}
+
 fn num(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
 }
@@ -270,6 +338,32 @@ fn parse_body(body: &str, want_procs: bool) -> Result<Sample, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_entries_expand() {
+        assert!(is_batch("http://h:8000"));
+        assert!(is_batch("http://h:8000/"));
+        assert!(is_batch("http://h:8000/api/rgtop/frame"));
+        assert!(is_batch("http://h:8000/api/rgtop/frame/"));
+        assert!(!is_batch("http://h:8000/api/rgtop/frame/h100-3"));
+        assert!(!is_batch("h100-3"));
+
+        assert_eq!(batch_parts("http://h:8000").unwrap(), ("http://h:8000".into(), "api/rgtop/frame".into()));
+        // a server mounted under a prefix keeps it
+        assert_eq!(
+            batch_parts("http://h:8000/mon/api/rgtop/frame").unwrap(),
+            ("http://h:8000".into(), "mon/api/rgtop/frame".into())
+        );
+
+        let body = r#"{"code":0,"data":{"nodes":[{"node":"h100-3"},{"node":"h200-1"},
+                       {"node":"bad/../x"},{"node":""}]}}"#;
+        assert_eq!(parse_node_names(body).unwrap(), ["h100-3", "h200-1"]); // unsafe names skipped
+        assert!(parse_node_names(r#"{"data":{}}"#).is_err());
+
+        // entries that name a node (or are SSH aliases) pass through untouched
+        let kept = vec!["h1".to_string(), "http://h:1/api/rgtop/frame/n1".to_string(), "h1".to_string()];
+        assert_eq!(expand(kept, 1).unwrap(), ["h1", "http://h:1/api/rgtop/frame/n1"]);
+    }
 
     #[test]
     fn urls() {

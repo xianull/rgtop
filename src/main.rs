@@ -211,6 +211,15 @@ fn run() -> i32 {
         return update::update();
     }
     let hosts = load_hosts(args.hosts);
+    // A bare API address (no node in it) stands for every node the server
+    // lists: one entry instead of typing dozens of per-node URLs.
+    let hosts = match http::expand(hosts, args.timeout) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("rgtop: {e}");
+            return 1;
+        }
+    };
     if hosts.is_empty() {
         eprintln!(
             "rgtop: no hosts. Pass ssh host aliases as arguments, set $RGTOP_HOSTS, \
