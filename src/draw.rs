@@ -885,6 +885,13 @@ fn card_title(
     if let Some(u) = s.uptime {
         bottom.add(&fmt_uptime(u), th.dim);
     }
+    // HTTP frames: how old the measurement is (the server samples on its own
+    // schedule), so a 30 s-old reading can't be mistaken for a live one. Shown
+    // in --once too: that is exactly when a stale snapshot is worth flagging.
+    if let Some(a) = s.data_age {
+        bottom.add(if bottom.w() > 0 { " · " } else { "" }, th.dim)
+            .add(&format!("{}s old", D0(a)), if a > cx.stale_after { th.warn } else { th.dim });
+    }
     if let Some(l) = h.latency.filter(|_| cx.live) {
         bottom.add(if bottom.w() > 0 { " · " } else { "" }, th.dim).add(&format!("↻ {}ms", D0(l * 1000.0)), th.dim);
     }
